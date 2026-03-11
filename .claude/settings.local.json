@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install -e \".[dev]\")",
+      "Bash(python -m pytest tests/ -v --timeout=120)",
+      "Bash(python -m pytest tests/ -v)",
+      "Bash(python -c \"import georules as gr; print\\(f''georules {gr.__version__}''\\)\")",
+      "Bash(python -m pytest tests/ --tb=short -q)"
+    ]
+  }
+}
