@@ -1,10 +1,35 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.colors import Normalize
+from matplotlib.colors import Normalize, LinearSegmentedColormap
+
+# ---------------------------------------------------------------------------
+# Unified GeoRules colormap: grey → yellow → orange/brown
+#
+# Maps linearly from reservoir-quality 0 (worst) to max (best):
+#   0.0  →  grey    (#999999)   — shale / inactive / zero porosity
+#   0.5  →  yellow  (#e8c840)   — intermediate sand / moderate porosity
+#   1.0  →  brown   (#b85a18)   — best sand / high porosity
+#
+# Works for both:
+#   • Continuous properties (porosity, permeability) with mask_zeros=True
+#     — zero cells become NaN and render as light grey via set_bad()
+#   • Discrete facies (0=shale, 1=bar, 2=channel) with mask_zeros=False
+#     — 0 maps to grey, 1 to yellow, 2 to brown/orange
+# ---------------------------------------------------------------------------
+GEORULES_CMAP = LinearSegmentedColormap.from_list(
+    'georules',
+    ['#999999', '#e8c840', '#b85a18'],
+    N=256,
+)
+
+DEFAULT_CMAP = 'georules'
+# Register so plt.get_cmap('georules') works everywhere
+plt.colormaps.register(GEORULES_CMAP, name='georules', force=True)
 
 
 def plot_cube_slices(data_3d, ix=None, iy=None, iz=None,
-                     cmap='YlOrRd', vmin=None, vmax=None, title=None, ax=None):
+                     cmap=DEFAULT_CMAP, vmin=None, vmax=None, title=None,
+                     ax=None, mask_zeros=True):
     """Plot 3 orthogonal slices arranged as faces of a cube.
 
     Parameters
@@ -15,6 +40,10 @@ def plot_cube_slices(data_3d, ix=None, iy=None, iz=None,
     cmap, vmin, vmax : colormap args
     title : str
     ax : Axes3D or None
+    mask_zeros : bool
+        If True (default), zero values are replaced with NaN and shown as
+        grey.  Set to False for categorical data (e.g. facies) where zero
+        is a valid category.
 
     Returns
     -------
@@ -28,8 +57,11 @@ def plot_cube_slices(data_3d, ix=None, iy=None, iz=None,
     if iz is None:
         iz = 0
 
-    # Mask zeros for better visualization
-    masked = np.where(data_3d > 0, data_3d, np.nan)
+    # Mask zeros for better visualization (skip for categorical data)
+    if mask_zeros:
+        masked = np.where(data_3d > 0, data_3d, np.nan)
+    else:
+        masked = data_3d.astype(float)
     if vmin is None:
         vmin = np.nanmin(masked) if np.any(~np.isnan(masked)) else 0
     if vmax is None:
@@ -44,7 +76,7 @@ def plot_cube_slices(data_3d, ix=None, iy=None, iz=None,
     else:
         fig = ax.get_figure()
 
-    grey = np.array([0.6, 0.6, 0.6, 1.0])
+    grey = np.array([0.8, 0.8, 0.8, 1.0])  # light grey for NaN/inactive
 
     # Draw surfaces back-to-front for correct depth ordering (azim=225).
     # 1. YZ slice at x=ix (farthest from camera)
@@ -87,7 +119,8 @@ def plot_cube_slices(data_3d, ix=None, iy=None, iz=None,
 
 
 def plot_slices(data_3d, axis=2, indices=None, ncols=4,
-                cmap='YlOrRd', vmin=None, vmax=None, title=None):
+                cmap=DEFAULT_CMAP, vmin=None, vmax=None, title=None,
+                mask_zeros=True):
     """Plot 2D slices along one axis as a subplot grid.
 
     Parameters
@@ -101,6 +134,10 @@ def plot_slices(data_3d, axis=2, indices=None, ncols=4,
         Columns in subplot grid.
     cmap, vmin, vmax : colormap args
     title : str
+    mask_zeros : bool
+        If True (default), zero values are replaced with NaN and shown as
+        grey.  Set to False for categorical data (e.g. facies) where zero
+        is a valid category.
 
     Returns
     -------
@@ -110,7 +147,10 @@ def plot_slices(data_3d, axis=2, indices=None, ncols=4,
     if indices is None:
         indices = np.linspace(0, n - 1, min(8, n), dtype=int)
 
-    masked = np.where(data_3d > 0, data_3d, np.nan)
+    if mask_zeros:
+        masked = np.where(data_3d > 0, data_3d, np.nan)
+    else:
+        masked = data_3d.astype(float)
     if vmin is None:
         vmin = np.nanmin(masked) if np.any(~np.isnan(masked)) else 0
     if vmax is None:
@@ -127,7 +167,7 @@ def plot_slices(data_3d, axis=2, indices=None, ncols=4,
     xlabel, ylabel = axis_labels[axis]
 
     cmap_obj = plt.get_cmap(cmap).copy()
-    cmap_obj.set_bad(color='grey')
+    cmap_obj.set_bad(color='#cccccc')  # light grey for NaN/inactive
 
     for i, idx in enumerate(indices):
         sl = np.take(masked, idx, axis=axis)
