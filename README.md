@@ -11,7 +11,7 @@ pip install georules
 For development:
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/ElnaraRustamzade/GeoRules.git
 cd GeoRules
 pip install -e ".[dev]"
 ```
