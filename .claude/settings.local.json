@@ -11,7 +11,9 @@
       "Bash(python3:*)",
       "Bash(python -m jupyter nbconvert --to notebook --execute notebooks/tutorial.ipynb --output tutorial_executed.ipynb --ExecutePreprocessor.timeout=300)",
       "Bash(git status -u)",
-      "Bash(python -m pytest tests/ -q)"
+      "Bash(python -m pytest tests/ -q)",
+      "Bash(python debug_find_ripples2.py)",
+      "Bash(python debug_georules_params_in_pyclipse.py)"
     ]
   }
 }

@@ -24,7 +24,10 @@ GEORULES_CMAP = LinearSegmentedColormap.from_list(
 
 DEFAULT_CMAP = 'georules'
 # Register so plt.get_cmap('georules') works everywhere
-plt.colormaps.register(GEORULES_CMAP, name='georules', force=True)
+try:
+    plt.colormaps.register(GEORULES_CMAP, name='georules', force=True)
+except AttributeError:
+    plt.register_cmap(name='georules', cmap=GEORULES_CMAP)
 
 
 def plot_cube_slices(data_3d, ix=None, iy=None, iz=None,
@@ -166,7 +169,11 @@ def plot_slices(data_3d, axis=2, indices=None, ncols=4,
     axis_labels = {0: ('Y', 'Z'), 1: ('X', 'Z'), 2: ('X', 'Y')}
     xlabel, ylabel = axis_labels[axis]
 
-    cmap_obj = plt.get_cmap(cmap).copy()
+    cmap_obj = plt.get_cmap(cmap)
+    try:
+        cmap_obj = cmap_obj.copy()
+    except AttributeError:
+        pass  # older matplotlib doesn't support .copy()
     cmap_obj.set_bad(color='#cccccc')  # light grey for NaN/inactive
 
     for i, idx in enumerate(indices):

@@ -175,13 +175,18 @@ class LobeLayer(Layer):
             r1 = np.sqrt((dx2 / asp)**2 + dy2**2)
             bot = int(np.rint(surface0[ii, jj]))
             top = int(min(np.rint(surface[ii, jj]), self.nz))
+            # Use continuous surface values for smooth porosity gradients
+            surf_bot = surface0[ii, jj]
+            surf_top = min(surface[ii, jj], float(self.nz))
+            thickness = surf_top - surf_bot
             poromin = 0.05
-            poromax = 0.3 * ((1 - bot / self.nz) / 2 + 0.5) + 0.05 if upthinning else 0.35
-            if top > bot:
+            poromax = 0.3 * ((1 - surf_bot / self.nz) / 2 + 0.5) + 0.05 if upthinning else 0.35
+            if top > bot and thickness > 1e-10:
                 facies[bot:top, ii, jj][facies[bot:top, ii, jj] == 0] = i
                 for kk in np.arange(bot, top):
                     upthinning_factor = ((1 - kk / self.nz) / 2 + 0.5) if upthinning else 1
-                    poro[kk, ii, jj] = 0.3 * ((top - kk) / (top - bot)) * (1 - (r1 / r)) * upthinning_factor + 0.05
+                    vert_decay = max((surf_top - kk) / thickness, 0.0)
+                    poro[kk, ii, jj] = 0.3 * vert_decay * (1 - (r1 / r)) * upthinning_factor + 0.05
                     poronorm = (poro[kk, ii, jj] - poromin) / (poromax - poromin)
                     bouma_seq_lims = [0, 0.1, 0.2, 0.3, 0.4, 1]
                     for bouma_idx in range(len(bouma_seq_lims) - 1):
