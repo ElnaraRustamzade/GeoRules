@@ -5,45 +5,21 @@ from .base import Layer
 __all__ = ["ChannelLayerBase", "MeanderingChannelLayer", "BraidedChannelLayer"]
 
 
-def _rotate_xy_to_azimuth(arr, azimuth_deg):
-    """Rotate a (nx, ny, nz) array in the XY plane to a compass azimuth.
-
-    The fluvial streamline engine always flows along +x.  To point the
-    channel belt along ``azimuth_deg`` using the same compass
-    convention as ``DeltaLayer`` (0°=+x, 45°=+x,-y, 90°=-y, 135°=-x,-y,
-    180°=-x, 225°=-x,+y, 270°=+y, 315°=+x,+y — CW from +x per
-    ``extra/azimuth.jpg``), we rotate the output's XY plane by
-    ``-azimuth_deg`` (scipy uses CCW-positive convention).
-
-    ``order=0`` (nearest-neighbour) preserves integer facies values
-    and keeps facies/poro aligned after resampling.  Cells outside
-    the rotated support are filled with 0 (inactive/shale).
-    """
-    if float(azimuth_deg) % 360.0 == 0.0:
-        return arr
-    from scipy.ndimage import rotate
-    return rotate(arr, -float(azimuth_deg), axes=(0, 1),
-                  reshape=False, order=0, mode='constant', cval=0.0)
-
-
 class ChannelLayerBase(Layer):
     """Base class for channel-type geological layers."""
 
-    def _finalize_properties(self, engine_poro, engine_facies, poro_ave,
-                             azimuth=0.0):
+    def _finalize_properties(self, engine_poro, engine_facies, poro_ave):
         """Convert engine output arrays into standard Layer properties.
 
         Shared by all channel subclasses to ensure consistent
-        poro_mat, facies, active, perm_mat derivation.  When
-        ``azimuth != 0``, rotates the XY plane of the engine output so
-        the channel belt points along the requested compass azimuth
-        (same convention as ``DeltaLayer``).
+        poro_mat, facies, active, perm_mat derivation.  Azimuth is
+        applied inside the streamline engine (see
+        ``_fluvial.fluvial._rotated_stream``) so the engine output is
+        already oriented along the requested compass direction.
         """
-        poro_rot = _rotate_xy_to_azimuth(engine_poro, azimuth)
-        facies_rot = _rotate_xy_to_azimuth(engine_facies, azimuth)
         self.poro_ave = poro_ave
-        self.poro_mat = poro_rot
-        self.facies = facies_rot.astype(int)
+        self.poro_mat = engine_poro
+        self.facies = engine_facies.astype(int)
         self.active = (self.facies > 0).astype(int)
         self.perm_mat = 10.0 * np.exp(20.0 * self.poro_mat) * self.active
 
@@ -149,11 +125,13 @@ class MeanderingChannelLayer(ChannelLayerBase):
               45°  → +x,-y    90°  → -y       135° → -x,-y
               180° → -x       225° → -x,+y    270° → +y
               315° → +x,+y
-            Implemented as a nearest-neighbour XY rotation of the
-            engine's 3D output, so channel physics (migration,
-            avulsion, aggradation) are unchanged — only the belt
-            heading changes.  Cells outside the rotated support are
-            marked inactive.
+            Implemented the same way as in ``DeltaLayer``: at each
+            stamp the streamline coordinates ``(cx, cy)`` and tangent
+            ``(vx, vy)`` are rotated around the grid centre before
+            ``genchannel`` paints them, so only the channels are
+            oriented — non-channel cells stay inactive without being
+            shuffled.  Channel physics (migration, avulsion,
+            aggradation) are unchanged.
         """
         from ._fluvial import fluvial
 
@@ -172,10 +150,10 @@ class MeanderingChannelLayer(ChannelLayerBase):
             level_jump_ratio=level_jump_ratio,
             prob_avul_inside=prob_avul_inside,
             prob_avul_outside=prob_avul_outside,
+            azimuth=azimuth,
         )
         engine.simulation(nchannel=n_channels)
-        self._finalize_properties(engine.poro, engine.facies, poro_ave,
-                                  azimuth=azimuth)
+        self._finalize_properties(engine.poro, engine.facies, poro_ave)
 
 
 class BraidedChannelLayer(MeanderingChannelLayer):

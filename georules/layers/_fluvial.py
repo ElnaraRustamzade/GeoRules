@@ -23,7 +23,8 @@ class fluvial:
                  migration_distance_ratio=1.0, boundary_reflect=True,
                  aggradation_mode='discrete', level_reseed_prob=0.6,
                  level_jump_ratio=1.0,
-                 prob_avul_inside=0.0, prob_avul_outside=0.0):
+                 prob_avul_inside=0.0, prob_avul_outside=0.0,
+                 azimuth=0.0):
         self.myidx = myidx
         self.b = b
         self.dwratio = dwratio
@@ -102,6 +103,16 @@ class fluvial:
         # meandering run.
         self.prob_avul_inside = prob_avul_inside
         self.prob_avul_outside = prob_avul_outside
+        # Compass-azimuth flow direction (CW from +x, same convention
+        # as DeltaLayer — see extra/azimuth.jpg).  The engine generates
+        # streamlines natively in its +x frame; at each genchannel
+        # stamp the streamline's (cx, cy) and tangent (vx, vy) are
+        # rotated CW by ``azimuth`` around the grid centre so the
+        # rasterised channels flow along the requested direction.
+        # Curvature is rotation-invariant so no adjustment is needed.
+        self.azimuth_rad = float(np.deg2rad(azimuth))
+        self._cos_az = float(np.cos(self.azimuth_rad))
+        self._sin_az = float(np.sin(self.azimuth_rad))
         g = 9.8
         self.g = g
         self.us0 = ((g * Q * I) / (2.0 * b * Cf))**(1.0 / 3.0)
@@ -110,6 +121,11 @@ class fluvial:
         self.ymin = ymn - 0.5 * ysiz
         self.xmax = self.xmin + xsiz * nx
         self.ymax = self.ymin + ysiz * ny
+        # Rotation pivot for azimuth-aware stamping — centre of the
+        # physical grid.  Precomputed so ``_rotated_stream_coords`` is
+        # a pure arithmetic helper.
+        self._pivot_x = 0.5 * (self.xmin + self.xmax)
+        self._pivot_y = 0.5 * (self.ymin + self.ymax)
         self.station_len = station * self.xmax
         self.x = np.linspace(xmn, self.xmax - xmn, self.nx)
         self.y = np.linspace(ymn, self.ymax - ymn, self.ny)
@@ -261,6 +277,28 @@ class fluvial:
         self.maxb = 2 * np.max(self.chwidth)
         self.touch_b = 0
 
+    def _rotated_stream(self):
+        """Return (cx, cy, vx, vy) rotated by ``self.azimuth_rad`` CW
+        around the grid centre.  Identity when ``azimuth == 0``.
+
+        Matches the compass convention in ``extra/azimuth.jpg``: the
+        engine's native +x flow direction maps to (cos az, -sin az) in
+        the rotated frame, so az=0°→+x, 90°→-y, 180°→-x, 270°→+y (plus
+        the diagonals at 45°/135°/225°/315°).  Curvature is a signed
+        scalar, rotation-invariant in 2D, so it's reused as-is.
+        """
+        if self.azimuth_rad == 0.0:
+            return self.cx, self.cy, self.vx, self.vy
+        c, s = self._cos_az, self._sin_az
+        px, py = self._pivot_x, self._pivot_y
+        dx = self.cx - px
+        dy = self.cy - py
+        cx_r = px + dx * c + dy * s
+        cy_r = py - dx * s + dy * c
+        vx_r = self.vx * c + self.vy * s
+        vy_r = -self.vx * s + self.vy * c
+        return cx_r, cy_r, vx_r, vy_r
+
     def _stamp_current_streamline(self, NNN):
         """Paint the current streamline into ``self.facies`` at
         ``self.chelev``.  Assumes ``cal_curv`` has been called so
@@ -276,10 +314,11 @@ class fluvial:
         """
         if self.cx.size < 3:
             return
+        cx_r, cy_r, vx_r, vy_r = self._rotated_stream()
         genchannel(
             self.b, self.xsiz, self.ysiz, self.chelev, self.zsiz,
-            self.nx, self.ny, self.nz, self.cx, self.cy, self.x, self.y,
-            self.vx, self.vy, self.curv, self.LV_asym, self.lV_height,
+            self.nx, self.ny, self.nz, cx_r, cy_r, self.x, self.y,
+            vx_r, vy_r, self.curv, self.LV_asym, self.lV_height,
             self.ps, self.pavul, self.out, self.totalid, self.facies,
             self.poro, self.poro0, self.thalweg, self.chwidth, self.dwratio,
             [1000000000], NNN,
@@ -494,10 +533,11 @@ class fluvial:
             if self.touch_b == 1:
                 self.out = 1
                 self.cal_curv()
+                cx_r, cy_r, vx_r, vy_r = self._rotated_stream()
                 genchannel(
                     self.b, self.xsiz, self.ysiz, self.chelev, self.zsiz,
-                    self.nx, self.ny, self.nz, self.cx, self.cy, self.x, self.y,
-                    self.vx, self.vy, self.curv, self.LV_asym, self.lV_height,
+                    self.nx, self.ny, self.nz, cx_r, cy_r, self.x, self.y,
+                    vx_r, vy_r, self.curv, self.LV_asym, self.lV_height,
                     self.ps, self.pavul, self.out, self.totalid, self.facies,
                     self.poro, self.poro0, self.thalweg, self.chwidth,
                     self.dwratio, [10000000000], NNN,
@@ -589,11 +629,12 @@ class fluvial:
                 # clips to the grid, and keeping out-of-grid nodes lets
                 # cells near the boundary still pick them as nearest
                 # neighbours so no gap forms before the edge.
+                cx_r, cy_r, vx_r, vy_r = self._rotated_stream()
                 genchannel(
                     self.b, self.xsiz, self.ysiz, self.chelev, self.zsiz,
-                    self.nx, self.ny, self.nz, self.cx, self.cy,
+                    self.nx, self.ny, self.nz, cx_r, cy_r,
                     self.x, self.y,
-                    self.vx, self.vy, self.curv, self.LV_asym, self.lV_height,
+                    vx_r, vy_r, self.curv, self.LV_asym, self.lV_height,
                     self.ps, self.pavul, self.out, self.totalid, self.facies,
                     self.poro, self.poro0, self.thalweg, self.chwidth,
                     self.dwratio, [1000000000], NNN,
