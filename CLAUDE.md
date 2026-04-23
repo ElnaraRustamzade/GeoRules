@@ -35,3 +35,12 @@ Building realistic 3D geological models typically requires expensive commercial 
 - Properties: `poro_mat` (porosity, 0-1), `perm_mat` (permeability, mD), `active` (0/1 facies mask)
 - Physics parameters go in `create_geology()`, not `__init__()` — init is grid-only
 - Channel internals use Numba JIT and are prefixed with `_` (private)
+
+## Parameter units — gotchas
+
+- **`perm_ave` and `perm_std` for `LobeLayer` and `GaussianLayer` are in log10(mD) space**, not linear mD. See the docstrings in `layers/lobe.py` and `layers/gaussian.py`. Typical sensible ranges:
+  - `perm_ave`: `[0, 4]` → mean perm spans 1 to 10,000 mD
+  - `perm_std`: `[0.1, 1.5]` → log10-std (factor-of-1.3 to factor-of-30 spread)
+  - Passing linear-mD values (e.g. `perm_ave=500`) makes the internal `10**perm_mat` overflow float64 and the output cells saturate to the on-disk clip ceiling (60000 mD). `poro_ave` and `poro_std` stay in linear [0, 1] units.
+- `poro_mat` is not zeroed outside `active` in GaussianLayer (the Gaussian porosity field fills all cells); if you want "reservoir-only" porosity at consumption time, do `poro * facies` yourself.
+- `facies` semantics differ by layer: `LobeLayer.facies` is a multi-valued lobe index (1..N); `MeanderingChannelLayer`/`BraidedChannelLayer`/`DeltaLayer.facies` are 0/1; `GaussianLayer` has no `facies` attribute — use `active` for the 0/1 mask.
