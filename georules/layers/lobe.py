@@ -1,34 +1,52 @@
 import numpy as np
 from scipy.ndimage import gaussian_filter
-from scipy.stats import multivariate_normal
 
 from .base import Layer
+from ._fluvial import _gauss_clip
 
 
 class LobeLayer(Layer):
     """Layer with turbidite lobe deposition geology."""
 
     def create_geology(self, poro_ave, perm_ave, poro_std, perm_std, ntg,
-                       dhmin=4, dhmax=4, rmin=42, rmax=44, asp=1.5,
-                       theta0=0, m=100, upthinning=True, bouma_factor=0):
+                       dh_ave=4.0, dh_std=0.5, r_ave=450.0, r_std=20.0,
+                       asp=1.5, azimuth=0.0, azimuth_std=10.0,
+                       m=100, upthinning=True, bouma_factor=0):
         """Generate turbidite lobe geology.
 
         Parameters
         ----------
         poro_ave, perm_ave : float
-            Mean porosity and log10(permeability).
+            Mean porosity and log10(permeability in mD).
         poro_std, perm_std : float
             Standard deviation of porosity and log10(permeability).
         ntg : float
             Net-to-gross ratio (0 to 1).
-        dhmin, dhmax : float
-            Lobe height range (grid cells).
-        rmin, rmax : float
-            Lobe radius range (grid cells).
+        dh_ave, dh_std : float
+            Per-event lobe thickness, **in meters**, drawn as
+            ``N(dh_ave, dh_std)`` and clipped to a small positive
+            minimum.
+        r_ave, r_std : float
+            Per-event lobe radius (semi-minor in physical metres), drawn
+            as ``N(r_ave, r_std)`` and clipped to positive. The lobe
+            is a true ellipse in physical (m) space — cell offsets are
+            scaled by ``self.dx`` / ``self.dy`` independently before
+            the rotation, so non-isotropic cells (``dx != dy``) and
+            any azimuth are handled correctly.
         asp : float
-            Lobe aspect ratio (elongation).
-        theta0 : float
-            Mean lobe orientation (degrees).
+            Lobe aspect ratio (semi-major / semi-minor, dimensionless).
+        azimuth : float
+            Mean lobe-elongation orientation (degrees), measured
+            **clockwise from +x** to match the convention used by
+            ``ChannelLayer`` / ``DeltaLayer``: ``azimuth=0``
+            elongates lobes along +x, ``azimuth=90`` along -y. Range
+            can be 0-360 or any equivalent — the engine wraps via
+            cos/sin.
+        azimuth_std : float
+            Per-event Gaussian std (degrees) on the lobe orientation,
+            applied independently to every stamp. Default 10°. A clean
+            cone of well-aligned lobes uses ~5°; turbidite-realistic
+            scatter is ~15-25°.
         m : float
             Compensation exponent (higher = more clustered stacking).
         upthinning : bool
@@ -43,8 +61,9 @@ class LobeLayer(Layer):
         self.ntg = ntg
 
         allfacies, allporo, self.allsurface = self._lobemodeling(
-            dhmax=dhmax, dhmin=dhmin, rmin=rmin, rmax=rmax, asp=asp,
-            theta0=theta0, m=m, upthinning=upthinning, bouma_factor=bouma_factor,
+            dh_ave=dh_ave, dh_std=dh_std, r_ave=r_ave, r_std=r_std,
+            asp=asp, azimuth=azimuth, azimuth_std=azimuth_std, m=m,
+            upthinning=upthinning, bouma_factor=bouma_factor,
         )
         # Swap axes from (nz, ny, nx) to (nx, ny, nz)
         lobe_poro = np.swapaxes(allporo[-1], 0, -1)
@@ -64,38 +83,36 @@ class LobeLayer(Layer):
         self.active = lobe_poro + lambda_perturb * facies_perturb
         self.active = (self.active > np.percentile(self.active.flatten(), (1 - ntg) * 100))
 
-        # Property field: lobe structure + Gaussian noise
+        # Porosity field: lobe radial-decay structure + small Gaussian
+        # noise mapped to the requested ``poro_ave ± poro_std`` envelope.
         poro_field = np.random.normal(0, 1, (3 * nx, 3 * ny, 3 * nz))
         poro_nug = np.random.normal(0, 1, (3 * nx, 3 * ny, 3 * nz))
         poro_field = gaussian_filter(poro_field, sand_filt, mode='wrap') + sand_nug * poro_nug
         poro_field = poro_field[nx:2*nx, ny:2*ny, nz:2*nz]
         poro_field = lobe_poro + lambda_perturb * poro_field
-        perm_field = poro_field.copy()
-
-        # Quantile transform with correlated bivariate normal
-        cov = [[1, 0.6], [0.6, 1]]
-        samples = multivariate_normal([0, 0], cov).rvs(int(poro_field.size * 1.2))
-        samples[:, 0] = samples[:, 0] * poro_std + poro_ave
-        samples[:, 1] = samples[:, 1] * perm_std + perm_ave
-
-        samples = samples[samples[:, 0] < (poro_ave + 5 * poro_std)]
-        samples = samples[samples[:, 0] > (poro_ave - 5 * poro_std)]
-        samples = samples[samples[:, 1] < (perm_ave + 5 * perm_std)]
-        samples = samples[:poro_field.size]
-
+        # Rescale poro field to N(poro_ave, poro_std) per-cell with the
+        # lobe geometry as the "structure" — no bivariate copula
+        # required, so we don't lose correlation through rank-quantile
+        # filtering.
         flat = poro_field.flatten()
-        order = np.argsort(flat)
-        samples = samples[np.argsort(samples[:poro_field.size, 0])]
-        flat[order] = samples[:, 0]
-        perm_flat = flat.copy()
-        perm_flat[order] = samples[:, 1]
-
+        flat = poro_ave + poro_std * (flat - flat.mean()) / max(flat.std(), 1e-9)
+        flat = np.clip(flat, poro_ave - 5 * poro_std, poro_ave + 5 * poro_std)
         self.poro_mat = flat.reshape(nx, ny, nz)
-        self.perm_mat = perm_flat.reshape(nx, ny, nz)
+
+        # Permeability: deterministic Kozeny-Carman-style linear map —
+        # log10(perm) tracks poro with slope = perm_std / poro_std so
+        # the per-cell log-perm distribution exactly matches the
+        # requested perm_std. Tiny residual noise (~0.05 log10) gives
+        # cells a slight decorrelated jitter for visual texture without
+        # diluting the trend.
+        slope = perm_std / max(poro_std, 1e-6)
+        log_perm = perm_ave + slope * (self.poro_mat - poro_ave)
+        log_perm = log_perm + np.random.normal(0, 0.05, log_perm.shape)
+        log_perm = np.clip(log_perm, perm_ave - 5 * perm_std, perm_ave + 5 * perm_std)
 
         self.active = self.active.astype(np.int8)
         self.poro_mat = self.poro_mat * self.active
-        self.perm_mat = (10 ** self.perm_mat) * self.active
+        self.perm_mat = (10.0 ** log_perm) * self.active
 
         # ``lobe_id`` keeps the per-lobe stacking index (1..N) for users
         # who want to colour by lobe generation. ``facies`` is the
@@ -109,8 +126,9 @@ class LobeLayer(Layer):
             self.lobe_id = np.zeros((nx, ny, nz), dtype=np.int16)
         self.facies = np.where(self.active == 1, 3, -1).astype(np.int8)
 
-    def _lobemodeling(self, dhmax=4, dhmin=4, rmin=42, rmax=44, asp=1.5,
-                      theta0=0, m=100, upthinning=True, bouma_factor=0):
+    def _lobemodeling(self, dh_ave=4.0, dh_std=0.5, r_ave=450.0, r_std=20.0,
+                      asp=1.5, azimuth=0.0, azimuth_std=10.0, m=100,
+                      upthinning=True, bouma_factor=0):
         facies = np.zeros((self.nz, self.ny, self.nx))
         poro = facies.copy() - 0.1
         allsurface = []
@@ -118,7 +136,14 @@ class LobeLayer(Layer):
         surface0 = surface.copy()
         lat_size = self.nx * self.ny
         loc_idx = np.arange(lat_size)
-        theta0 = theta0 / 180 * np.pi
+        # Major axis lies along (cos(az), -sin(az)) — the same direction
+        # the fluvial engine uses for channel flow at the same azimuth,
+        # so a lobe with asp=2 at azimuth=N elongates in the same map
+        # direction a channel at azimuth=N would flow in. Equivalent to
+        # rotating cell offsets clockwise by ``azimuth`` before the
+        # ellipse check.
+        theta_base = np.deg2rad(azimuth)
+        azimuth_std_rad = np.deg2rad(azimuth_std)
         allfacies = []
         allporo = []
         allsurface.append(surface.copy())
@@ -135,9 +160,9 @@ class LobeLayer(Layer):
             y = loc // self.nx
             x = loc - self.nx * y
 
-            theta = theta0 + np.random.normal(0, 20 / 180 * np.pi)
-            dh = np.random.uniform(dhmin, dhmax)
-            r = np.random.uniform(rmin, rmax)
+            theta = theta_base + np.random.normal(0, azimuth_std_rad)
+            dh = _gauss_clip(dh_ave, dh_std, lo=1e-6)
+            r = _gauss_clip(r_ave, r_std, lo=1e-6)
 
             self._update_surface(x, y, r, asp, theta, dh, surface)
             if i != 0:
@@ -152,34 +177,61 @@ class LobeLayer(Layer):
             self._assign_prop(xchange, ychange, x, y, theta, surface0, surface,
                               facies, r, poro, dz, asp, i + 1, upthinning, bouma_factor)
             i += 1
-            if i == iiii or surface.max() >= self.nz + 4:
+            # Terminate when the LOWEST column has filled to the grid
+            # top — i.e. compensational stacking has filled the entire
+            # basin. Stopping on ``surface.max()`` instead would fire
+            # the moment any single tall lobe pokes through the top,
+            # leaving the late stamps to dominate the upper part of the
+            # column they cover (a contiguous sand "ceiling" artifact).
+            if i == iiii or surface.min() >= self.nz:
                 allfacies.append(facies.copy())
                 allporo.append(poro.copy())
                 break
         return allfacies, allporo, allsurface
 
     def _update_surface(self, x, y, r, asp, theta, dh, surface):
-        for ii in np.arange(max(0, int(y - r * asp)), min(int(y + r * asp), self.ny)):
-            for jj in np.arange(max(0, int(x - r * asp)), min(int(x + r * asp), self.nx)):
-                dx = jj - x
-                dy = ii - y
-                dx2 = dx * np.cos(theta) - dy * np.sin(theta)
-                dy2 = dx * np.sin(theta) + dy * np.cos(theta)
-                r1 = np.sqrt((dx2 / asp)**2 + dy2**2)
-                if r1**2 <= r**2:
-                    dz0 = -dh / (r**2) * (r1**2) + dh
-                    surface[ii, jj] = surface[ii, jj] + dz0
+        # Geometry is done in physical (m) space: cell offsets are
+        # scaled by ``self.dx`` / ``self.dy`` independently before the
+        # rotation, so the lobe stays a true ellipse for any azimuth
+        # and any cell aspect (dx != dy). ``surface`` is in cell-z
+        # units, so the per-cell deposit ``dz0`` (m) is divided by
+        # ``self.dz`` before accumulation.
+        cos_t = np.cos(theta)
+        sin_t = np.sin(theta)
+        # Tight rotated-ellipse half-extent (Steiner) along physical axes
+        half_x_m = np.sqrt((r * asp * cos_t) ** 2 + (r * sin_t) ** 2)
+        half_y_m = np.sqrt((r * asp * sin_t) ** 2 + (r * cos_t) ** 2)
+        bx = int(np.ceil(half_x_m / self.dx)) + 1
+        by = int(np.ceil(half_y_m / self.dy)) + 1
+        r2 = r * r
+        inv_dz = 1.0 / self.dz
+        for ii in range(max(0, y - by), min(y + by + 1, self.ny)):
+            dy_m = (ii - y) * self.dy
+            for jj in range(max(0, x - bx), min(x + bx + 1, self.nx)):
+                dx_m = (jj - x) * self.dx
+                ax_m = dx_m * cos_t - dy_m * sin_t   # along major axis
+                cr_m = dx_m * sin_t + dy_m * cos_t   # cross axis
+                r1_sq = (ax_m / asp) ** 2 + cr_m ** 2
+                if r1_sq <= r2:
+                    dz0_m = dh * (1.0 - r1_sq / r2)
+                    surface[ii, jj] += dz0_m * inv_dz
 
     def _assign_prop(self, xchange, ychange, x, y, theta, surface0, surface,
                      facies, r, poro, dz, asp, i, upthinning, bouma_factor):
+        # ``r`` is in meters; cell offsets are scaled per-axis to
+        # physical coords before the rotation so the radial ratio
+        # ``r1 / r`` (used for the porosity decay) is correct in
+        # physical space at any azimuth and any ``dx != dy``.
+        cos_t = np.cos(theta)
+        sin_t = np.sin(theta)
         for n in range(xchange.size):
             ii = ychange[n]
             jj = xchange[n]
-            dx = jj - x
-            dy = ii - y
-            dx2 = dx * np.cos(theta) - dy * np.sin(theta)
-            dy2 = dx * np.sin(theta) + dy * np.cos(theta)
-            r1 = np.sqrt((dx2 / asp)**2 + dy2**2)
+            dx_m = (jj - x) * self.dx
+            dy_m = (ii - y) * self.dy
+            ax_m = dx_m * cos_t - dy_m * sin_t
+            cr_m = dx_m * sin_t + dy_m * cos_t
+            r1 = np.sqrt((ax_m / asp) ** 2 + cr_m ** 2)
             bot = int(np.rint(surface0[ii, jj]))
             top = int(min(np.rint(surface[ii, jj]), self.nz))
             # Use continuous surface values for smooth porosity gradients

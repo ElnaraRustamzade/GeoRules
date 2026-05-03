@@ -294,6 +294,38 @@ class fluvial:
         self.poro = np.zeros((nx, ny, nz), dtype=np.float32)
         self.poro0 = 0.3
 
+        # Per-cell auxiliary fields written alongside ``facies`` by every
+        # event stamp. Used downstream by ``ChannelLayer._finalize_facies_table``
+        # to apply the geologically-correct per-event Walker upward-fining
+        # ramp + per-event poro/perm multipliers (see channel.py for the
+        # combination formula).
+        #
+        # ``depth_norm[ix,iy,iz]`` ∈ [0, 1] for CH/LA cells: 0 at the top
+        # of the channel cross-section, 1 at the base. 0.5 (neutral, ramp
+        # = 1.0) for non-channel facies and inactive cells.
+        # ``poro_mult_field`` defaults to 1.0; ``log_perm_offset_field`` to 0.0.
+        self.depth_norm = np.full((nx, ny, nz), 0.5, dtype=np.float32)
+        self.poro_mult_field = np.ones((nx, ny, nz), dtype=np.float32)
+        self.log_perm_offset_field = np.zeros((nx, ny, nz), dtype=np.float32)
+
+        # Per-event std for the K-C-coupled multiplier draws. Small —
+        # the dominant scale of variability is now the per-realization
+        # mult Sobol-sampled at the sample level (see ChannelLayer /
+        # DeltaLayer ``poro_realization_mult`` / ``perm_realization_mult``).
+        # Per-event mult is the wiggle WITHIN a realization, e.g. one
+        # channel slightly cleaner than another in the same reservoir.
+        self.poro_mult_std = 0.04
+        self.log_perm_offset_std = 0.12
+
+        # Cache for the current channel event's K-C-coupled poro/perm pair.
+        # ``_stamp_channel`` redraws and refreshes this; ``_stamp_levee``
+        # and ``_stamp_splays`` consume the same pair so a channel +
+        # its levees/splays share one consistent depositional regime
+        # (geologically: levees and splays form contemporaneously with
+        # the channel they border, fed by the same flood pulse).
+        self._event_poro_mult = 1.0
+        self._event_log_perm_offset = 0.0
+
         if seed is not None:
             np.random.seed(int(seed))
 
@@ -806,10 +838,19 @@ class fluvial:
         else:
             p = weights / weights.sum()
             ianode = int(np.random.choice(n, p=p))
-        local_azi = float(self.azi[ianode])
-        # Direct branch-spread control (DeltaLayer ``branch_spread_deg``):
-        # perturb the new tail's launch azimuth by N(0, stdev_branch_azi).
-        # 0 ⇒ tail launches along parent direction (Alluvsim default).
+        # Anchor the new tail to the regional trunk azimuth ``mCHazi``,
+        # NOT to the local segment direction at the avulsion node.
+        # Geologically: avulsion picks a new path driven by the regional
+        # gradient, not by where the old channel happened to be pointing
+        # locally. Using ``self.azi[ianode]`` (Alluvsim default) caused
+        # accumulating drift across many avulsions — late branches
+        # would launch sideways or even backward to flow, especially
+        # in delta runs where ``probAvulInside`` is high (~0.7) and
+        # 1000+ avulsions stack across generations. Anchoring to
+        # ``mCHazi`` keeps every new branch aligned with the regional
+        # gradient; ``branch_spread_deg`` (DeltaLayer) still adds
+        # controlled angular spread on top.
+        local_azi = float(self.mCHazi)
         if self.stdev_branch_azi > 0.0:
             local_azi += float(np.random.normal(0.0, self.stdev_branch_azi))
         chsinu = float(getattr(self, '_chsinu', self.mCHsinu))
@@ -919,6 +960,48 @@ class fluvial:
 
     # ----------------------------------------------------------------- stamps
 
+    def _draw_event_mults(self) -> tuple[float, float]:
+        """Kozeny-Carman-coupled per-event ``(poro_mult, log_perm_offset)``.
+
+        Replicates the coupling that ``LobeLayer`` uses (see
+        ``georules/layers/lobe.py``): higher poro → higher perm in the
+        same event, with a small independent scatter so the relationship
+        isn't perfectly 1:1. Slope = ``log_perm_offset_std / poro_mult_std``
+        keeps the marginal stds at the requested values while binding
+        the two together within a single event.
+
+        Used in three places:
+
+        * ``_stamp_channel`` — draws and caches the pair for the current
+          channel event (reused by levee/splay stamps that follow).
+        * ``_stamp_abandoned`` — draws fresh (later, separate event).
+        * ``_stamp_neck_oxbows`` — draws fresh per dropped loop.
+
+        Clipping caps the multipliers at ±2σ.
+        """
+        pm = float(np.random.normal(1.0, self.poro_mult_std))
+        # ±2σ clip on poro_mult
+        pm_lo = max(0.05, 1.0 - 2.0 * self.poro_mult_std)
+        pm_hi = 1.0 + 2.0 * self.poro_mult_std
+        if pm < pm_lo:
+            pm = pm_lo
+        elif pm > pm_hi:
+            pm = pm_hi
+        # Kozeny-Carman: log_perm tracks (poro_mult - 1) with the same
+        # std ratio lobes use, plus a small independent scatter (lobes
+        # add N(0, 0.05) on log10 perm; we match).
+        slope = self.log_perm_offset_std / max(self.poro_mult_std, 1e-6)
+        scatter = float(np.random.normal(0.0, 0.05))
+        po = slope * (pm - 1.0) + scatter
+        # ±2σ clip on the result so extreme combinations stay physical.
+        po_lo = -2.0 * self.log_perm_offset_std
+        po_hi = +2.0 * self.log_perm_offset_std
+        if po < po_lo:
+            po = po_lo
+        elif po > po_hi:
+            po = po_hi
+        return pm, po
+
     def _stamp_channel(self, facies_code: int, erode_above: bool):
         if self.cx is None or self.cx.size < 3:
             return
@@ -932,6 +1015,13 @@ class fluvial:
         chelev_arr = self.chelev_arr if (self.chelev_arr is not None
                                           and self.chelev_arr.size == self.cx.size) \
                      else np.full(self.cx.size, self.chelev, dtype=np.float64)
+        # Draw the K-C-coupled (poro_mult, log_perm_offset) pair for
+        # this channel event and cache it on the engine so the
+        # subsequent _stamp_levee / _stamp_splays calls inherit the
+        # same depositional regime.
+        ev_pm, ev_po = self._draw_event_mults()
+        self._event_poro_mult = ev_pm
+        self._event_log_perm_offset = ev_po
         genchannel(
             float(self.maxCHhalfwidth), self.xsiz, self.ysiz, chelev_arr, self.zsiz,
             self.nx, self.ny, self.nz, cx_r, cy_r, self.x, self.y,
@@ -945,6 +1035,10 @@ class fluvial:
             ntg_counter=self.ntg_counter,
             compute_poro=False,
             erode_above=bool(erode_above),
+            depth_norm=self.depth_norm,
+            poro_mult_field=self.poro_mult_field,
+            log_perm_offset_field=self.log_perm_offset_field,
+            ev_poro_mult=ev_pm, ev_log_perm_offset=ev_po,
         )
 
     def _stamp_splays(self, n_splay: int, n_lobe_per_splay: int):
@@ -993,6 +1087,11 @@ class fluvial:
                 )
                 if cx_lobe is None or cx_lobe.size < 3:
                     continue
+                # Reuse the host channel event's K-C pair — splays form
+                # contemporaneously with the channel that fed them, so
+                # they inherit the same poro/perm regime.
+                ev_pm = self._event_poro_mult
+                ev_po = self._event_log_perm_offset
                 # Paint lobe envelope along this walker
                 paint_lobe(
                     cx_lobe, cy_lobe,
@@ -1003,6 +1102,10 @@ class fluvial:
                     self.xsiz, self.ysiz, self.zsiz,
                     self.facies, self.ntg_counter, lk_cs=CS,
                     xmn=self.xmn, ymn=self.ymn,
+                    depth_norm=self.depth_norm,
+                    poro_mult_field=self.poro_mult_field,
+                    log_perm_offset_field=self.log_perm_offset_field,
+                    ev_poro_mult=ev_pm, ev_log_perm_offset=ev_po,
                 )
                 # Also paint the thin gensplay sheet (`facies = 5` → CS) at
                 # iz_chelev-1 with linear taper (item 1.10/2.26)
@@ -1013,6 +1116,10 @@ class fluvial:
                     self.xsiz, self.ysiz, self.zsiz,
                     self.facies, self.ntg_counter,
                     xmn=self.xmn, ymn=self.ymn, lk_cs=CS,
+                    depth_norm=self.depth_norm,
+                    poro_mult_field=self.poro_mult_field,
+                    log_perm_offset_field=self.log_perm_offset_field,
+                    ev_poro_mult=ev_pm, ev_log_perm_offset=ev_po,
                 )
 
     def _build_splay_walker(self, x0: float, y0: float, azi0: float, dist: float):
@@ -1078,6 +1185,10 @@ class fluvial:
         chelev_arr = self.chelev_arr if (self.chelev_arr is not None
                                           and self.chelev_arr.size == self.cx.size) \
                      else np.full(self.cx.size, self.chelev, dtype=np.float64)
+        # Reuse the host channel event's K-C pair — natural levees
+        # form contemporaneously with the channel they border.
+        ev_pm = self._event_poro_mult
+        ev_po = self._event_log_perm_offset
         paint_levee(
             cx_r, cy_r, self.curv, chwidth_arr, chelev_arr,
             float(LV_depth), float(LV_width), float(LV_height), float(LV_asym), float(LV_thin),
@@ -1085,6 +1196,10 @@ class fluvial:
             self.nx, self.ny, self.nz, self.facies, self.ntg_counter,
             float(self.maxCHhalfwidth),
             xmn=self.xmn, ymn=self.ymn, lk_lv=LV,
+            depth_norm=self.depth_norm,
+            poro_mult_field=self.poro_mult_field,
+            log_perm_offset_field=self.log_perm_offset_field,
+            ev_poro_mult=ev_pm, ev_log_perm_offset=ev_po,
         )
 
     def _stamp_neck_oxbows(self, surviving_idx, n_pre,
@@ -1140,6 +1255,9 @@ class fluvial:
             chelev_l = chelev_pre[s_idx:e_idx].copy()
             if cx_l.size < 3:
                 continue
+            # Neck-cutoff oxbow plug is a separate later event from the
+            # original channel deposition — fresh K-C draw.
+            ev_pm, ev_po = self._draw_event_mults()
             paint_abandoned(
                 float(chwidth_l.max()), cx_l, cy_l, vx_l, vy_l, thalweg_l,
                 chwidth_l, chelev_l, self.gr_dwratio, mud_prop,
@@ -1147,6 +1265,10 @@ class fluvial:
                 self.nx, self.ny, self.nz, self.facies,
                 self.ntg_counter, self.ffch_counter,
                 xmn=self.xmn, ymn=self.ymn, lk_ffch=FFCH, lk_ch=CH,
+                depth_norm=self.depth_norm,
+                poro_mult_field=self.poro_mult_field,
+                log_perm_offset_field=self.log_perm_offset_field,
+                ev_poro_mult=ev_pm, ev_log_perm_offset=ev_po,
             )
 
     def _stamp_abandoned(self, mud_prop: float):
@@ -1161,6 +1283,10 @@ class fluvial:
         chelev_arr = self.chelev_arr if (self.chelev_arr is not None
                                           and self.chelev_arr.size == self.cx.size) \
                      else np.full(self.cx.size, self.chelev, dtype=np.float64)
+        # End-of-level abandonment is a later event (channel was
+        # abandoned, mud filled in) — fresh K-C draw, distinct from the
+        # original channel-deposition regime.
+        ev_pm, ev_po = self._draw_event_mults()
         paint_abandoned(
             float(self.maxCHhalfwidth), cx_r, cy_r, vx_r, vy_r, self.thalweg,
             chwidth_arr, chelev_arr, self.gr_dwratio, mud_prop,
@@ -1168,6 +1294,10 @@ class fluvial:
             self.nx, self.ny, self.nz, self.facies,
             self.ntg_counter, self.ffch_counter,
             xmn=self.xmn, ymn=self.ymn, lk_ffch=FFCH, lk_ch=CH,
+            depth_norm=self.depth_norm,
+            poro_mult_field=self.poro_mult_field,
+            log_perm_offset_field=self.log_perm_offset_field,
+            ev_poro_mult=ev_pm, ev_log_perm_offset=ev_po,
         )
 
     # ----------------------------------------------------------------- main event loop
@@ -1202,6 +1332,14 @@ class fluvial:
             # whatever the lower levels consumed.
             if self.ntime_per_level:
                 ev_counter = 0
+            # Snapshot the global ntg / ffch counters at the start of this
+            # level so the inner ``while`` loop can stop when *this level*
+            # has deposited its independent NTG share — regardless of how
+            # much lower levels overshot. Without this delta-tracking the
+            # cumulative target would let lower-level overshoot satisfy
+            # upper levels and produce bottom-heavy cubes at low NTG.
+            ntg_at_level_start = int(self.ntg_counter[0])
+            ffch_at_level_start = int(self.ffch_counter[0])
             # Progradation: shift entry x and rebuild the pool so all
             # subsequent draws start at the new apex position.
             if (self.mCHentry_x_offset_per_level is not None
@@ -1216,7 +1354,8 @@ class fluvial:
                     return
                 self.cal_curv()
 
-            while (self.ntg_counter[0] - self.ffch_counter[0]) < level_target[ilevel]:
+            while ((self.ntg_counter[0] - ntg_at_level_start)
+                   - (self.ffch_counter[0] - ffch_at_level_start)) < level_target[ilevel]:
                 if ev_counter >= self.ntime:
                     # ntime cap exit (AL:988-991 — no extra abandon; the
                     # end-of-level path below handles abandonment).
@@ -1295,14 +1434,22 @@ class fluvial:
     # ----------------------------------------------------------------- helpers
 
     def _level_targets(self) -> np.ndarray:
-        """Cumulative NTG-cell target per level (port of ``streamsim.for:560-572``)."""
+        """Per-level NTG-cell target — *independent* across levels.
+
+        Each level is responsible for depositing
+        ``NTGtarget × cells_per_level`` sand cells in its own z-slice;
+        the simulation loop tracks that as a delta against an
+        ``ntg_at_level_start`` snapshot, so a level's event count is
+        independent of how much lower levels deposited. This gives
+        full-z population at any NTGtarget — without the original
+        Pyrcz-Alluvsim cumulative-target artefact where lower levels
+        could "skip" upper levels when they overshot the cumulative
+        target.
+
+        The returned array is the *delta target per level* (each
+        element is the same value when nlevel divides evenly).
+        """
         total_cells = self.nx * self.ny * self.nz
         NTGcount = int(round(self.NTGtarget * total_cells))
-        iz_at_level = np.array([
-            int(np.clip(round(z / self.zsiz), 1, self.nz)) for z in self.level_z
-        ], dtype=np.int64)
-        iz_top = max(int(iz_at_level[-1]), 1)
-        targets = np.array([
-            int(round(NTGcount * iz_lvl / iz_top)) for iz_lvl in iz_at_level
-        ], dtype=np.int64)
-        return targets
+        per_level = max(1, int(round(NTGcount / max(self.nlevel, 1))))
+        return np.full(self.nlevel, per_level, dtype=np.int64)

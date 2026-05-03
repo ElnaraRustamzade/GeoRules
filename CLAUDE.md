@@ -38,6 +38,7 @@ Building realistic 3D geological models typically requires expensive commercial 
 
 ## Parameter units — gotchas
 
+- **Length is in meters, everywhere.** `x_len, y_len, z_len, top_depth, dx, dy, dz` are meters; the fluvial engine hardcodes `g = 9.8 m/s²`, so all `mCH*`, `mLV*`, `mCSLO*`, `mdistMigrate` (channel/delta) and `dhmin/dhmax/rmin/rmax` (lobe) and `facies_filter/sand_filter` (gaussian) are also meters. `LobeLayer` and `GaussianLayer` convert these physical inputs to cell-units internally via `self.dx/dy/dz`.
 - **`perm_ave` and `perm_std` for `LobeLayer` and `GaussianLayer` are in log10(mD) space**, not linear mD. See the docstrings in `layers/lobe.py` and `layers/gaussian.py`. Typical sensible ranges:
   - `perm_ave`: `[0, 4]` → mean perm spans 1 to 10,000 mD
   - `perm_std`: `[0.1, 1.5]` → log10-std (factor-of-1.3 to factor-of-30 spread)

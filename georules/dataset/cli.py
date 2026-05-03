@@ -52,8 +52,10 @@ def main(config_path: str) -> None:
     for n_done, i in enumerate(my_indices, 1):
         job = jobs[i]
         try:
-            facies, poro, perm, meta = generate_sample(job, cfg["grid"])
-            writer.add(facies, poro, perm, meta)
+            facies, poro, perm, facies_alluvsim, meta = generate_sample(
+                job, cfg["grid"]
+            )
+            writer.add(facies, poro, perm, facies_alluvsim, meta)
         except Exception as exc:
             # A small fraction of stochastic parameter combinations trigger
             # pre-existing bugs in the underlying layer code (e.g. spline

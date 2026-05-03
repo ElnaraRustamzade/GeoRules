@@ -42,8 +42,21 @@ def find_near_grid(cx, cy, good, xsiz, ysiz, xmn, ymn, b, nx, ny):
 def mychannel(nz, mynx, myny, localx, localy, x, y, vx, vy, cy, cx,
               thalweg, chelev_arr, zsiz, dd, facies, poro, chwidth,
               idmat, dwratio, merge_overlap, facies_code, ntg_counter,
-              compute_poro, erode_above, poro0):
-    """Paint one streamline's U-shape into facies (and poro if asked)."""
+              compute_poro, erode_above, poro0,
+              depth_norm, poro_mult_field, log_perm_offset_field,
+              ev_poro_mult, ev_log_perm_offset):
+    """Paint one streamline's U-shape into facies + per-cell auxiliary fields.
+
+    Writes ``depth_norm[ix,iy,iz]`` = (chelev - z_face) / (chelev - chbot)
+    for every CH/LA cell stamped — vertical position within this channel
+    event's cross-section, used by ``_finalize_facies_table`` to apply
+    the Walker-1992 upward-fining ramp PER EVENT (no per-column leakage).
+    Erode-above branch resets depth_norm to neutral 0.5.
+
+    Per-event scalars ``ev_poro_mult`` / ``ev_log_perm_offset`` are stamped
+    into ``poro_mult_field`` / ``log_perm_offset_field`` at every cell this
+    event paints — last-event-wins overwrite, matching facies semantics.
+    """
     for myid in range(localx.size):
         idx = mynx[myid]
         idy = myny[myid]
@@ -89,6 +102,26 @@ def mychannel(nz, mynx, myny, localx, localy, x, y, vx, vy, cy, cx,
                 if z_face > chelev and facies[idx, idy, iz] >= 1:
                     ntg_counter[0] -= 1
                     facies[idx, idy, iz] = -1  # FF
+                    depth_norm[idx, idy, iz] = np.float32(0.5)
+                    poro_mult_field[idx, idy, iz] = np.float32(1.0)
+                    log_perm_offset_field[idx, idy, iz] = np.float32(0.0)
+
+        # Per-event ramp denominator: thalweg max depth ``maxD`` (constant
+        # across all cells stamped by this event, irrespective of lateral
+        # position w). Using maxD gives a geologically correct
+        # thalweg-centred 3D fall-off: depth_norm peaks at the deepest
+        # point of the channel cross-section (thalweg base) and falls
+        # off both upward AND laterally toward the banks. The U-shape
+        # geometry constrains near-bank cells to live only in the thin
+        # near-surface sliver where ``chelev - z_face`` is small, so they
+        # automatically get small depth_norm without needing a separate
+        # lateral coordinate. (Earlier per-cell formula
+        # ``(chelev - chbot(w))`` was a bug — it normalised each lateral
+        # column to its own pinched extent, so bank cells incorrectly
+        # ramped to 1.0 at their local bottom.)
+        ramp_denom = maxD
+        if ramp_denom < 1e-9:
+            ramp_denom = 1e-9
 
         # Stamp the U-shape body.  Per-cell continuous-z criterion
         # (AL:219 ``if z > chbot and z < chelev``).
@@ -99,12 +132,59 @@ def mychannel(nz, mynx, myny, localx, localy, x, y, vx, vy, cy, cx,
                     ntg_counter[0] += 1
                 facies[idx, idy, iz] = facies_code
 
+                # 3D radial fall-off from the thalweg-base point of THIS
+                # event's U-shape — geologically the highest-energy
+                # depositional locus. Two factors, multiplicatively
+                # combined (matches the lobe-layer's centroid-radial
+                # gradient pattern):
+                #
+                #   v = (chelev - z_face) / maxD                      [0..1]
+                #       1 at the channel base (thalweg bottom),
+                #       0 at the channel top.
+                #
+                #   l = 1 - lateral_distance_from_thalweg / max_side  [0..1]
+                #       1 at the thalweg lateral position (wid = a·WW),
+                #       0 at either bank (wid = 0 or wid = WW).
+                #       Asymmetric U-shapes (a ≠ 0.5) normalise each
+                #       side independently so both banks reach 0.
+                #
+                # depth_norm = v · l → maximum at thalweg base, smoothly
+                # decaying upward AND laterally outward — exactly the
+                # 3D lobe-style envelope the user asked for.
+                v = (chelev - z_face) / ramp_denom
+                if v < 0.0:
+                    v = 0.0
+                elif v > 1.0:
+                    v = 1.0
+                # Lateral distance from thalweg in [0, 1]
+                thalweg_w = a * WW
+                if wid < thalweg_w:
+                    half = thalweg_w
+                else:
+                    half = WW - thalweg_w
+                if half < 1e-9:
+                    ld = 0.0
+                else:
+                    ld = abs(wid - thalweg_w) / half
+                if ld < 0.0:
+                    ld = 0.0
+                elif ld > 1.0:
+                    ld = 1.0
+                l_factor = 1.0 - ld
+                dn = np.float32(v * l_factor)
+                depth_norm[idx, idy, iz] = dn
+                poro_mult_field[idx, idy, iz] = np.float32(ev_poro_mult)
+                log_perm_offset_field[idx, idy, iz] = np.float32(ev_log_perm_offset)
+
                 if compute_poro:
                     if maxD > 1e-9:
                         depth_into_channel = chelev - z_face
-                        depth_norm = depth_into_channel / max(maxD, 1e-9)
+                        # Scalar local — distinct from the per-cell ``depth_norm``
+                        # field above (renamed to avoid Numba type-unification
+                        # collision with the parameter).
+                        dn_local = depth_into_channel / max(maxD, 1e-9)
                         new_poro = (
-                            (0.9 / (1.0 + np.exp(-4.0 * (depth_norm - 0.2))) + 0.1)
+                            (0.9 / (1.0 + np.exp(-4.0 * (dn_local - 0.2))) + 0.1)
                             * poro0 * min((chelev - chbot) / max(maxD, 1e-9), 1.0)**2 + 0.1
                         )
                         if merge_overlap:
@@ -150,11 +230,22 @@ def genchannel(b, xsiz, ysiz, chelev_arr, zsiz, nx, ny, nz, cx, cy, x, y,
                facies, poro, poro0, thalweg, chwidth, dwratio, cutoff, NN=800,
                *, xmn=0.0, ymn=0.0,
                merge_overlap=False, facies_code=1, ntg_counter=None,
-               compute_poro=True, erode_above=False):
+               compute_poro=True, erode_above=False,
+               depth_norm=None, poro_mult_field=None,
+               log_perm_offset_field=None,
+               ev_poro_mult=1.0, ev_log_perm_offset=0.0):
     """Public wrapper around ``mychannel`` — Alluvsim ``genchannel.for`` entry.
 
     ``chelev_arr`` is the per-node CHelev array (item 2.11). For a flat
     channel it can be a constant array; for graded channels it varies.
+
+    ``depth_norm`` / ``poro_mult_field`` / ``log_perm_offset_field`` are
+    per-cell auxiliary fields (float32, shape ``(nx,ny,nz)``) that the
+    kernel writes alongside ``facies``. They drive the Walker upward-
+    fining ramp + per-event poro/perm variability in
+    ``_finalize_facies_table``. ``ev_poro_mult`` / ``ev_log_perm_offset``
+    are the freshly-drawn per-event scalars (one pair per stamp call).
+    Tests / standalone callers can omit these (None → no aux output).
     """
     if ntg_counter is None:
         ntg_counter = np.zeros(1, dtype=np.int64)
@@ -162,6 +253,14 @@ def genchannel(b, xsiz, ysiz, chelev_arr, zsiz, nx, ny, nz, cx, cy, x, y,
         chelev_arr = np.full(cx.size, float(chelev_arr), dtype=np.float64)
     elif chelev_arr.size != cx.size:
         chelev_arr = np.full(cx.size, float(chelev_arr.mean()), dtype=np.float64)
+    # Provide neutral-default aux arrays so the kernel signature is
+    # always satisfied (tests in tests/ don't pass these).
+    if depth_norm is None:
+        depth_norm = np.full((nx, ny, nz), 0.5, dtype=np.float32)
+    if poro_mult_field is None:
+        poro_mult_field = np.ones((nx, ny, nz), dtype=np.float32)
+    if log_perm_offset_field is None:
+        log_perm_offset_field = np.zeros((nx, ny, nz), dtype=np.float32)
     ndis = cx.size
     good = np.zeros((nx, ny))
     find_near_grid(cx, cy, good, xsiz, ysiz, xmn, ymn, b, nx, ny)
@@ -183,5 +282,7 @@ def genchannel(b, xsiz, ysiz, chelev_arr, zsiz, nx, ny, nz, cx, cy, x, y,
     mychannel(nz, mynx, myny, localx, localy, x, y, vx, vy, cy, cx, thalweg,
               chelev_arr, zsiz, dd, facies, poro, chwidth, idmat,
               dwratio, bool(merge_overlap), int(facies_code), ntg_counter,
-              bool(compute_poro), bool(erode_above), float(poro0))
+              bool(compute_poro), bool(erode_above), float(poro0),
+              depth_norm, poro_mult_field, log_perm_offset_field,
+              float(ev_poro_mult), float(ev_log_perm_offset))
     return 0

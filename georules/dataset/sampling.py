@@ -10,12 +10,28 @@ of samples.
 
 Per-parameter specs supported:
 
-- ``{"range": [lo, hi]}``                    continuous float uniform
-- ``{"range": [lo, hi], "scale": "log"}``    log-uniform in [lo, hi]
-- ``{"range": [lo, hi], "type": "int"}``     integer in [lo, hi] inclusive
-- ``{"choices": [...]}``                      categorical (int/str/bool)
-- ``{"value": v}``                            fixed scalar
-- ``{"levels": N}`` (grid sampling only)     number of grid steps on that axis
+- ``{"range": [lo, hi]}``                       continuous float uniform
+- ``{"range": [lo, hi], "scale": "log"}``       log-uniform in [lo, hi]
+- ``{"range": [lo, hi], "type": "int"}``        integer in [lo, hi] inclusive
+- ``{"choices": [...]}``                         categorical (int/str/bool)
+- ``{"value": v}``                               fixed scalar
+- ``{"levels": N}`` (grid sampling only)        number of grid steps on that axis
+- ``{"fraction_of": "X", "value": k}``          derived: k * params["X"]
+- ``{"linear_of": "X", "slope": a, "intercept": b}``  derived: a*X + b
+  (intercept defaults to 0)
+- ``{"inverse_of": "X", "scale": s, "min": m, "max": M, "type": "int"}``
+  derived: clip(s / params["X"], m, M). Use this to auto-tune e.g.
+  ``nlevel`` so deeper channels stack fewer levels.
+- ``{"range": [...], "shared": "tag"}``         couple params by tying them
+  to the same Sobol/LHS coordinate — every param with the same tag uses
+  the same unit-cube draw, so they are 100%-rank-correlated. Use this
+  to avoid pathological corners (e.g. small lobes paired with high NTG).
+- ``{"range": [...], "shared": "tag", "jitter": j}`` — same as above
+  but mix in a fraction ``j ∈ [0, 1]`` of independent noise. ``j=0``
+  is pure shared (corr=1), ``j=0.5`` gives corr=0.5, ``j=1`` is fully
+  independent. Implemented as
+  ``u_effective = (1-j)*u_shared + j*u_indep`` where ``u_indep`` is
+  this param's own private Sobol column.
 
 Sampling strategies:
 
@@ -35,12 +51,20 @@ import numpy as np
 from scipy.stats import qmc
 
 
+def _is_fixed(spec: dict) -> bool:
+    return "value" in spec and not _is_derived(spec)
+
+
 @dataclass
 class _LayerState:
     name: str
     variable_names: list[str]
+    unit_col_map: list[int]      # primary column for each variable_name
+    jitter_col: list[int]        # extra independent column when jitter>0, else -1
+    jitter_amt: list[float]      # 0.0 when no jitter
+    derived: list[tuple]         # (name, spec) resolved per-sample after variables
     fixed: dict[str, Any]
-    unit: np.ndarray           # (count, d) float32 unit-cube samples
+    unit: np.ndarray             # (count, n_unit_cols) float32 unit-cube samples
     grid_combos: list[tuple] | None   # only for sampling="grid"
 
 
@@ -85,8 +109,21 @@ class JobList:
             params.update(dict(zip(state.variable_names, combo)))
         else:
             unit_row = state.unit[within]
-            for u, name in zip(unit_row, state.variable_names):
-                params[name] = _map_unit_value(float(u), params_cfg[name])
+            for name, pcol, jcol, jamt in zip(
+                state.variable_names, state.unit_col_map,
+                state.jitter_col, state.jitter_amt,
+            ):
+                u_primary = float(unit_row[pcol])
+                if jcol < 0:
+                    u = u_primary
+                else:
+                    u = (1.0 - jamt) * u_primary + jamt * float(unit_row[jcol])
+                params[name] = _map_unit_value(u, params_cfg[name])
+
+        # Derived params (fraction_of / linear_of) reference already-
+        # resolved variable / fixed params, so resolve them last.
+        for name, spec in state.derived:
+            params[name] = _resolve_derived(spec, params)
 
         return {"layer_type": lt, "params": params, "seed": seed}
 
@@ -111,23 +148,92 @@ def build_jobs(layers_cfg: dict, master_seed: int) -> JobList:
         section_seed = int((master_seed + 1) * 10007 + lt_id)
 
         params_cfg = cfg["params"]
-        variable_names = [k for k, s in params_cfg.items() if "value" not in s]
-        fixed = {k: s["value"] for k, s in params_cfg.items() if "value" in s}
+        # Three buckets: fixed (resolved at config-load), derived
+        # (resolved per-sample from other params), variable (consume
+        # unit-cube columns).
+        fixed: dict[str, Any] = {}
+        derived: list[tuple] = []
+        variable_names: list[str] = []
+        for k, s in params_cfg.items():
+            if _is_derived(s):
+                derived.append((k, s))
+            elif _is_fixed(s):
+                fixed[k] = s["value"]
+            else:
+                variable_names.append(k)
+
+        # Validate derived references — must point at a fixed or
+        # variable param, otherwise we'd hit KeyError per-sample.
+        _known = set(fixed) | set(variable_names)
+        for dname, dspec in derived:
+            ref = (dspec.get("fraction_of") or dspec.get("linear_of")
+                   or dspec.get("inverse_of"))
+            if ref not in _known:
+                raise ValueError(
+                    f"derived param {dname!r} references unknown param "
+                    f"{ref!r} (known: {sorted(_known)})"
+                )
+
+        # Assign unit-cube columns to variable params, honouring
+        # ``shared`` tags so multiple params can ride the same Sobol /
+        # LHS coordinate, and ``jitter`` which allocates an extra
+        # independent column blended in at fraction ``j``.
+        tag_to_col: dict[str, int] = {}
+        unit_col_map: list[int] = []
+        jitter_col: list[int] = []
+        jitter_amt: list[float] = []
+        n_cols = 0
+        for vn in variable_names:
+            spec = params_cfg[vn]
+            tag = spec.get("shared")
+            j = float(spec.get("jitter", 0.0))
+            if not (0.0 <= j <= 1.0):
+                raise ValueError(
+                    f"param {vn!r}: jitter must be in [0, 1], got {j}"
+                )
+            if tag is None:
+                if j > 0.0:
+                    raise ValueError(
+                        f"param {vn!r}: 'jitter' only makes sense with "
+                        "'shared' (an unshared param is already independent)"
+                    )
+                unit_col_map.append(n_cols)
+                n_cols += 1
+                jitter_col.append(-1)
+                jitter_amt.append(0.0)
+            else:
+                if tag not in tag_to_col:
+                    tag_to_col[tag] = n_cols
+                    n_cols += 1
+                unit_col_map.append(tag_to_col[tag])
+                if j > 0.0:
+                    jitter_col.append(n_cols)
+                    n_cols += 1
+                    jitter_amt.append(j)
+                else:
+                    jitter_col.append(-1)
+                    jitter_amt.append(0.0)
 
         sampling = cfg.get("sampling", "sobol")
         grid_combos = None
         if sampling == "grid":
+            # Grid is a full factorial of the variable params at fixed
+            # ``levels``; it doesn't use a unit cube, so ``shared`` and
+            # ``jitter`` are silently ignored. ``fraction_of`` /
+            # ``linear_of`` derived params are resolved per-sample in
+            # ``__getitem__`` after the combo is unpacked, so they work
+            # in grid mode just like they do in sobol/lhs/uniform.
             grid_combos = _grid_combos(variable_names, params_cfg, n)
             unit = np.empty((n, 0), dtype=np.float32)
-        elif not variable_names:
+        elif n_cols == 0:
             unit = np.empty((n, 0), dtype=np.float32)
         elif sampling == "sobol":
-            unit = _sample_sobol(len(variable_names), n, section_seed)
+            unit = _sample_sobol(n_cols, n, section_seed)
         elif sampling == "lhs":
-            unit = _sample_lhs(len(variable_names), n, section_seed)
+            unit = _sample_lhs(n_cols, n, section_seed)
         elif sampling == "uniform":
             unit = np.random.default_rng(section_seed).uniform(
-                size=(n, len(variable_names))
+                size=(n, n_cols)
             ).astype(np.float32)
         else:
             raise ValueError(f"unknown sampling strategy {sampling!r}")
@@ -135,6 +241,10 @@ def build_jobs(layers_cfg: dict, master_seed: int) -> JobList:
         layer_states[name] = _LayerState(
             name=name,
             variable_names=variable_names,
+            unit_col_map=unit_col_map,
+            jitter_col=jitter_col,
+            jitter_amt=jitter_amt,
+            derived=derived,
             fixed=fixed,
             unit=unit.astype(np.float32, copy=False),
             grid_combos=grid_combos,
@@ -167,6 +277,39 @@ def _sample_sobol(d: int, n: int, seed: int) -> np.ndarray:
 
 def _sample_lhs(d: int, n: int, seed: int) -> np.ndarray:
     return qmc.LatinHypercube(d=d, seed=seed).random(n)
+
+
+def _resolve_derived(spec: dict, params: dict):
+    if "fraction_of" in spec:
+        return float(spec["value"]) * float(params[spec["fraction_of"]])
+    if "linear_of" in spec:
+        slope = float(spec.get("slope", 1.0))
+        intercept = float(spec.get("intercept", 0.0))
+        return slope * float(params[spec["linear_of"]]) + intercept
+    if "inverse_of" in spec:
+        # value = scale / params[ref], optionally clipped to [min, max]
+        # and cast to int. Use this to auto-size nlevel so deeper
+        # channels stack fewer levels and shallower ones stack more.
+        scale = float(spec["scale"])
+        ref = float(params[spec["inverse_of"]])
+        if ref <= 0:
+            raise ValueError(
+                f"inverse_of param requires positive ref value, got {ref}"
+            )
+        v = scale / ref
+        if "min" in spec:
+            v = max(float(spec["min"]), v)
+        if "max" in spec:
+            v = min(float(spec["max"]), v)
+        if spec.get("type") == "int":
+            return int(round(v))
+        return float(v)
+    raise ValueError(f"unknown derived spec: {spec}")
+
+
+def _is_derived(spec: dict) -> bool:
+    return ("fraction_of" in spec or "linear_of" in spec
+            or "inverse_of" in spec)
 
 
 def _map_unit_value(u: float, spec: dict):

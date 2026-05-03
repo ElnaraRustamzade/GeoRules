@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -q regular
+#SBATCH -q premium
 #SBATCH -C cpu
 #SBATCH -N 4
 #SBATCH --ntasks-per-node=128

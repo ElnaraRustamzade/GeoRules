@@ -1,7 +1,7 @@
 """Delta layer — distributary-fan architecture (Alluvsim fluvial engine).
 
 :py:class:`DeltaLayer` is a thin subclass of
-:py:class:`~georules.layers.channel.MeanderingChannelLayer` that drives
+:py:class:`~georules.layers.channel.ChannelLayer` that drives
 the full Alluvsim event-loop fluvial engine (AR(2) walks +
 Sun-1996 bank-retreat migration + avulsion-inside + neck cutoff + level
 aggradation) with delta-tuned defaults (:data:`DELTA_FAN` preset).
@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .channel import MeanderingChannelLayer
+from .channel import ChannelLayer
 
 
 __all__ = ["DeltaLayer", "DELTA_FAN"]
@@ -138,10 +138,10 @@ def _paint_mouth_bar_into_engine(engine, tip_x, tip_y, tip_z, heading,
                     engine.facies[ix, iy, iz] = facies_code
 
 
-class DeltaLayer(MeanderingChannelLayer):
+class DeltaLayer(ChannelLayer):
     """Distributary-fan delta — Alluvsim-faithful event-loop simulation.
 
-    Subclass of :py:class:`MeanderingChannelLayer` that drives the same
+    Subclass of :py:class:`ChannelLayer` that drives the same
     fluvial engine with delta-tuned defaults (:data:`DELTA_FAN`).
 
     Architecture knobs (delta-only):
@@ -180,6 +180,8 @@ class DeltaLayer(MeanderingChannelLayer):
                        mouth_bar_hw_ratio: float = 0.06,
                        mouth_bar_dw_ratio: float = 0.08,
                        facies_props: dict | None = None,
+                       poro_realization_mult: float = 1.0,
+                       perm_realization_mult: float = 1.0,
                        seed: int | None = None,
                        **kwargs):
         """Generate a prograding distributary-fan delta.
@@ -290,8 +292,16 @@ class DeltaLayer(MeanderingChannelLayer):
             trunk_per_gen = np.full(n_generations, base_trunk)
 
         # Run n_generations independent simulations and merge.
+        # Merge rule: per cell, take the generation with the
+        # highest-quality facies (CH=4 > LA=3 > LV=2 > CS=1 > FFCH=0
+        # > FF=-1). The aux fields (depth_norm, poro_mult, log_perm_offset)
+        # also propagate from that winning generation so the upward-fining
+        # ramp + per-event noise stay consistent with the visible facies.
         nx_, ny_, nz_ = self.nx, self.ny, self.nz
         accum_facies = np.full((nx_, ny_, nz_), -1, dtype=np.int8)
+        accum_depth_norm = np.full((nx_, ny_, nz_), 0.5, dtype=np.float32)
+        accum_poro_mult = np.ones((nx_, ny_, nz_), dtype=np.float32)
+        accum_log_perm_offset = np.zeros((nx_, ny_, nz_), dtype=np.float32)
         accum_distal_tips: list[tuple[float, float, float, float]] = []
         last_engine = None
         for igen in range(n_generations):
@@ -308,7 +318,14 @@ class DeltaLayer(MeanderingChannelLayer):
                 **cfg,
             )
             engine.simulation()
-            np.maximum(accum_facies, engine.facies, out=accum_facies)
+            # Cells where this generation outranks the accumulated facies
+            # adopt this generation's aux values; ties keep the prior gen.
+            takeover = engine.facies > accum_facies
+            accum_facies = np.where(takeover, engine.facies, accum_facies)
+            accum_depth_norm = np.where(takeover, engine.depth_norm, accum_depth_norm)
+            accum_poro_mult = np.where(takeover, engine.poro_mult_field, accum_poro_mult)
+            accum_log_perm_offset = np.where(takeover, engine.log_perm_offset_field,
+                                             accum_log_perm_offset)
             accum_distal_tips.extend(engine.distal_tips)
             last_engine = engine
 
@@ -332,7 +349,17 @@ class DeltaLayer(MeanderingChannelLayer):
                     facies_code=3,   # LA = lateral-accretion / bar
                 )
 
-        self._finalize_facies_table(accum_facies, facies_props=facies_props)
+        self._finalize_facies_table(
+            accum_facies, facies_props=facies_props,
+            depth_norm=accum_depth_norm,
+            poro_mult_field=accum_poro_mult,
+            log_perm_offset_field=accum_log_perm_offset,
+            poro_realization_mult=poro_realization_mult,
+            perm_realization_mult=perm_realization_mult,
+        )
         # Expose final engine + accumulated distal tips for tutorial / debug
         self._engine = last_engine
         self._distal_tips = accum_distal_tips
+        if last_engine is not None:
+            self.poro_mult_std = float(last_engine.poro_mult_std)
+            self.log_perm_offset_std = float(last_engine.log_perm_offset_std)

@@ -22,6 +22,8 @@ def _paint_lobe_kernel(
     nx, ny, nz, xsiz, ysiz, zsiz, xmn, ymn, x_grid, y_grid,
     cx_lobe, cy_lobe, s_arr, lobe_LL, lobe_WW, lobe_l, lobe_w,
     lobe_hw, lobe_dw, lobe_datum, facies, ntg_counter, lk_cs,
+    depth_norm, poro_mult_field, log_perm_offset_field,
+    ev_poro_mult, ev_log_perm_offset,
 ):
     n_lobe = cx_lobe.size
     if n_lobe < 2:
@@ -75,7 +77,9 @@ def _paint_lobe_kernel(
             if lobe_top <= lobe_bottom:
                 continue
 
-            # Stamp CS — preserve CH(4) and LV(2) (AL ``gensplay.for:106``)
+            # Stamp CS — preserve CH(4) and LV(2) (AL ``gensplay.for:106``).
+            # Splay deposits are thin sheets without within-deposit upward
+            # fining → depth_norm = 0.5 (ramp = 1.0 in finalize).
             for iz in range(nz):
                 z_face = (iz + 0.5) * zsiz
                 if z_face >= lobe_bottom and z_face <= lobe_top:
@@ -85,6 +89,9 @@ def _paint_lobe_kernel(
                     if prev < 1:
                         ntg_counter[0] += 1
                     facies[ix, iy, iz] = lk_cs
+                    depth_norm[ix, iy, iz] = np.float32(0.5)
+                    poro_mult_field[ix, iy, iz] = np.float32(ev_poro_mult)
+                    log_perm_offset_field[ix, iy, iz] = np.float32(ev_log_perm_offset)
     return 0
 
 
@@ -98,6 +105,10 @@ def paint_lobe(
     xsiz: float, ysiz: float, zsiz: float,
     facies: np.ndarray, ntg_counter: np.ndarray,
     *, xmn: float = 0.0, ymn: float = 0.0, lk_cs: int = CS,
+    depth_norm: np.ndarray | None = None,
+    poro_mult_field: np.ndarray | None = None,
+    log_perm_offset_field: np.ndarray | None = None,
+    ev_poro_mult: float = 1.0, ev_log_perm_offset: float = 0.0,
 ):
     """Paint the lobe envelope along the supplied sub-streamline (gensplay walker).
 
@@ -108,6 +119,12 @@ def paint_lobe(
         return
     if lobe_LL <= 0 or lobe_WW <= 0:
         return
+    if depth_norm is None:
+        depth_norm = np.full((nx, ny, nz), 0.5, dtype=np.float32)
+    if poro_mult_field is None:
+        poro_mult_field = np.ones((nx, ny, nz), dtype=np.float32)
+    if log_perm_offset_field is None:
+        log_perm_offset_field = np.zeros((nx, ny, nz), dtype=np.float32)
     s_arr = np.zeros(cx_lobe.size, dtype=np.float64)
     s_arr[1:] = np.sqrt(np.diff(cx_lobe) ** 2 + np.diff(cy_lobe) ** 2)
     s_arr = np.cumsum(s_arr)
@@ -120,6 +137,8 @@ def paint_lobe(
         float(lobe_hw_ratio), float(lobe_dw_ratio),
         float(lobe_datum),
         facies, ntg_counter, int(lk_cs),
+        depth_norm, poro_mult_field, log_perm_offset_field,
+        float(ev_poro_mult), float(ev_log_perm_offset),
     )
 
 
@@ -127,6 +146,8 @@ def paint_lobe(
 def _paint_splay_kernel(
     nx, ny, nz, xsiz, ysiz, zsiz, xmn, ymn,
     cx_walk, cy_walk, chelev, chdepth, facies, ntg_counter, lk_cs,
+    depth_norm, poro_mult_field, log_perm_offset_field,
+    ev_poro_mult, ev_log_perm_offset,
 ):
     """Thin gensplay sheet at iz_chelev - 1 with linear taper (item 1.10/2.26).
 
@@ -156,6 +177,9 @@ def _paint_splay_kernel(
             if prev < 1:
                 ntg_counter[0] += 1
             facies[ix, iy, iiz] = lk_cs
+            depth_norm[ix, iy, iiz] = np.float32(0.5)
+            poro_mult_field[ix, iy, iiz] = np.float32(ev_poro_mult)
+            log_perm_offset_field[ix, iy, iiz] = np.float32(ev_log_perm_offset)
     return 0
 
 
@@ -167,12 +191,24 @@ def paint_splay(
     xsiz: float, ysiz: float, zsiz: float,
     facies: np.ndarray, ntg_counter: np.ndarray,
     *, xmn: float = 0.0, ymn: float = 0.0, lk_cs: int = CS,
+    depth_norm: np.ndarray | None = None,
+    poro_mult_field: np.ndarray | None = None,
+    log_perm_offset_field: np.ndarray | None = None,
+    ev_poro_mult: float = 1.0, ev_log_perm_offset: float = 0.0,
 ):
     """Paint the gensplay thin sheet along ``cx_walk, cy_walk``."""
     if cx_walk is None or cx_walk.size < 2:
         return
+    if depth_norm is None:
+        depth_norm = np.full((nx, ny, nz), 0.5, dtype=np.float32)
+    if poro_mult_field is None:
+        poro_mult_field = np.ones((nx, ny, nz), dtype=np.float32)
+    if log_perm_offset_field is None:
+        log_perm_offset_field = np.zeros((nx, ny, nz), dtype=np.float32)
     _paint_splay_kernel(
         nx, ny, nz, xsiz, ysiz, zsiz, xmn, ymn,
         cx_walk, cy_walk, float(chelev), float(chdepth),
         facies, ntg_counter, int(lk_cs),
+        depth_norm, poro_mult_field, log_perm_offset_field,
+        float(ev_poro_mult), float(ev_log_perm_offset),
     )

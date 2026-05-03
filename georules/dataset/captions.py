@@ -8,83 +8,167 @@ text-conditioned generative models.
 
 
 def caption_for(layer_type: str, params: dict) -> str:
-    """Return one sentence describing the reservoir parameters."""
-    fn = _DISPATCH.get(layer_type)
+    """Return one sentence describing the reservoir parameters.
+
+    ``layer_type`` may be the bare family name (``"lobe"``,
+    ``"channel"``, ``"delta"``) or the encoded ``"channel:PRESET"`` form
+    saved in the slim parquet — we strip the preset suffix to look up
+    the family-level template.
+    """
+    family = str(layer_type).split(":", 1)[0]
+    fn = _DISPATCH.get(family)
     if fn is None:
         raise ValueError(f"no caption template registered for {layer_type!r}")
     return fn(params)
 
 
+def _emit(parts, p, key, fmt):
+    """Append ``fmt.format(p[key])`` to ``parts`` only if ``key`` is in ``p``."""
+    if key in p:
+        parts.append(fmt.format(p[key]))
+
+
+def _emit_pair(parts, p, key_ave, key_std, prefix, suffix=""):
+    """Append e.g. ``"radius 2300 ± 460 m"`` only if at least the mean is set."""
+    if key_ave not in p:
+        return
+    s = f"{prefix} {p[key_ave]:.0f}"
+    if key_std in p:
+        s += f" ± {p[key_std]:.0f}"
+    parts.append(s + suffix)
+
+
 def _lobe(p):
-    # perm_ave is log10(mD) per LobeLayer.create_geology docstring.
-    perm_mD = 10.0 ** float(p["perm_ave"])
-    return (
-        f"Turbidite lobe deposit with mean porosity {p['poro_ave']:.2f}, "
-        f"mean permeability {perm_mD:.0f} mD (log10-std {p['perm_std']:.2f}), "
-        f"net-to-gross {p['ntg']:.2f}, "
-        f"lobe radius {p['rmin']:.0f}-{p['rmax']:.0f} m, "
-        f"aspect ratio {p['asp']:.1f}, "
-        f"thickness range {p['dhmin']}-{p['dhmax']} m, "
-        f"bouma factor {p.get('bouma_factor', 0):.1f}, "
-        f"upthinning {'enabled' if p.get('upthinning', True) else 'disabled'}."
-    )
+    head = "Turbidite-lobe deposit"
+    parts = []
+    _emit(parts, p, "poro_ave", "mean porosity {:.2f}")
+    if "perm_ave" in p:
+        perm_mD = 10.0 ** float(p["perm_ave"])
+        if "perm_std" in p:
+            parts.append(
+                f"mean permeability {perm_mD:.0f} mD "
+                f"(log10-std {p['perm_std']:.2f})"
+            )
+        else:
+            parts.append(f"mean permeability {perm_mD:.0f} mD")
+    _emit(parts, p, "ntg", "realized net-to-gross {:.2f}")
+    if "r_ave" in p:
+        s = f"semi-minor radius {p['r_ave']:.0f}"
+        if "r_std" in p:
+            s += f" ± {p['r_std']:.0f}"
+        s += " m"
+        if "r_ave_cells" in p:
+            s += f" ({p['r_ave_cells']:.1f} cells)"
+        parts.append(s)
+    if "r_major_m" in p:
+        s = f"semi-major radius {p['r_major_m']:.0f} m"
+        if "r_major_cells" in p:
+            s += f" ({p['r_major_cells']:.1f} cells)"
+        parts.append(s)
+    _emit(parts, p, "asp", "aspect ratio {:.1f}")
+    if "dh_ave" in p:
+        s = f"thickness {p['dh_ave']:.1f}"
+        if "dh_std" in p:
+            s += f" ± {p['dh_std']:.1f}"
+        s += " m"
+        if "dh_ave_cells" in p:
+            s += f" ({p['dh_ave_cells']:.1f} cells)"
+        parts.append(s)
+    _emit(parts, p, "bouma_factor", "Bouma factor {:.1f}")
+    _emit(parts, p, "azimuth", "lobe-elongation azimuth {:.0f}°")
+    if "upthinning" in p:
+        parts.append(
+            "thinning upwards" if p["upthinning"] else "without thinning upwards"
+        )
+    return f"{head} with " + ", ".join(parts) + "."
 
 
 def _gaussian(p):
-    # perm_ave is log10(mD) per GaussianLayer.create_geology docstring.
-    perm_mD = 10.0 ** float(p["perm_ave"])
-    return (
-        f"Heterogeneous sand-shale body from sequential Gaussian simulation "
-        f"with mean porosity {p['poro_ave']:.2f}, "
-        f"mean permeability {perm_mD:.0f} mD (log10-std {p['perm_std']:.2f}), "
-        f"net-to-gross {p['ntg']:.2f}, "
-        f"nugget {p.get('nugget', 0.05):.3f}."
-    )
+    parts = ["Heterogeneous sand-shale body from sequential Gaussian simulation"]
+    _emit(parts, p, "poro_ave", "mean porosity {:.2f}")
+    if "perm_ave" in p:
+        perm_mD = 10.0 ** float(p["perm_ave"])
+        if "perm_std" in p:
+            parts.append(
+                f"mean permeability {perm_mD:.0f} mD "
+                f"(log10-std {p['perm_std']:.2f})"
+            )
+        else:
+            parts.append(f"mean permeability {perm_mD:.0f} mD")
+    _emit(parts, p, "ntg", "net-to-gross {:.2f}")
+    _emit(parts, p, "nugget", "nugget {:.3f}")
+    return ", ".join(parts) + "."
 
 
-def _meandering(p):
-    return (
-        f"Meandering fluvial channel system, "
-        f"sinuosity {p.get('mCHsinu', 1.6):.2f}, "
-        f"channel depth {p.get('mCHdepth', 2.5):.1f} m, "
-        f"width:depth ratio {p.get('mCHwdratio', 10):.0f}, "
-        f"avulsion-inside probability {p.get('probAvulInside', 0.05):.2f}, "
-        f"abandoned-mud fraction {p.get('mFFCHprop', 0):.2f}, "
-        f"NTG target {p.get('NTGtarget', 0.10):.2f}, "
-        f"azimuth {p.get('azimuth', 0):.0f} deg."
-    )
+# Full prose names for each Pyrcz / Alluvsim channel preset. Spelled
+# out per "User Guide to the Alluvsim Program" §5 (PV = paleo-valley,
+# CB = channel and bar bodies, SH = sheet-sandstone) so captions read
+# like a sentence a sedimentologist would write.
+_CHANNEL_PRESET_NAMES = {
+    "PV_SHOESTRING":   "Paleo-valley shoestring reservoir",
+    "CB_JIGSAW":       "Channel-and-bar-bodies jigsaw reservoir",
+    "CB_LABYRINTH":    "Channel-and-bar-bodies labyrinthine reservoir",
+    "SH_DISTAL":       "Distal sheet-sandstone reservoir",
+    "SH_PROXIMAL":     "Proximal sheet-sandstone reservoir",
+    "MEANDER_OXBOW":   "Multi-storey meander-belt channel sandstone",
+}
 
 
-def _braided(p):
-    return (
-        f"Braided fluvial channel system, "
-        f"sinuosity {p.get('mCHsinu', 1.3):.2f}, "
-        f"channel depth {p.get('mCHdepth', 3.0):.1f} m, "
-        f"width:depth ratio {p.get('mCHwdratio', 16):.0f}, "
-        f"avulsion-inside probability {p.get('probAvulInside', 0.40):.2f}, "
-        f"abandoned-mud fraction {p.get('mFFCHprop', 0.5):.2f}, "
-        f"NTG target {p.get('NTGtarget', 0.30):.2f}, "
-        f"azimuth {p.get('azimuth', 0):.0f} deg."
-    )
+def _channel(p):
+    preset = p.get("preset")
+    head = _CHANNEL_PRESET_NAMES.get(preset, "Fluvial channel system")
+    parts = []
+    _emit(parts, p, "mCHsinu", "sinuosity {:.2f}")
+    if "mCHdepth" in p:
+        s = f"channel depth {p['mCHdepth']:.1f} m"
+        if "mCHdepth_cells" in p:
+            s += f" ({p['mCHdepth_cells']:.1f} cells)"
+        parts.append(s)
+    if "mCHwidth_m" in p:
+        s = f"channel width {p['mCHwidth_m']:.0f} m"
+        if "mCHwidth_cells" in p:
+            s += f" ({p['mCHwidth_cells']:.1f} cells)"
+        parts.append(s)
+    _emit(parts, p, "mCHwdratio", "width:depth ratio {:.0f}")
+    _emit(parts, p, "nlevel", "{:.0f} stacked levels")
+    _emit(parts, p, "probAvulInside", "in-belt avulsion probability {:.2f}")
+    _emit(parts, p, "mFFCHprop", "abandoned-mud fraction {:.2f}")
+    _emit(parts, p, "ntg", "realized net-to-gross {:.2f}")
+    _emit(parts, p, "azimuth", "flow azimuth {:.0f}°")
+    return f"{head} with " + ", ".join(parts) + "."
 
 
 def _delta(p):
-    return (
-        f"Distributary-fan delta with "
-        f"{int(p.get('n_generations', 8))} stacked generations, "
-        f"trunk length fraction {p.get('trunk_length_fraction', 0.4):.2f}, "
-        f"progradation {p.get('progradation_fraction', 0):.2f}, "
-        f"sinuosity {p.get('mCHsinu', 1.10):.2f}, "
-        f"abandoned-mud fraction {p.get('mFFCHprop', 0):.2f}, "
-        f"mouth bars {'on' if p.get('paint_mouth_bars', False) else 'off'}, "
-        f"azimuth {p.get('azimuth', 0):.0f} deg."
-    )
+    head = "Prograding distributary-fan delta"
+    parts = []
+    if "n_generations" in p:
+        parts.append(f"{int(p['n_generations'])} stacked depositional generations")
+    _emit(parts, p, "trunk_length_fraction", "trunk-length fraction {:.2f}")
+    _emit(parts, p, "progradation_fraction", "progradation fraction {:.2f}")
+    _emit(parts, p, "mCHsinu", "sinuosity {:.2f}")
+    if "mCHdepth" in p:
+        s = f"channel depth {p['mCHdepth']:.1f} m"
+        if "mCHdepth_cells" in p:
+            s += f" ({p['mCHdepth_cells']:.1f} cells)"
+        parts.append(s)
+    if "mCHwidth_m" in p:
+        s = f"channel width {p['mCHwidth_m']:.0f} m"
+        if "mCHwidth_cells" in p:
+            s += f" ({p['mCHwidth_cells']:.1f} cells)"
+        parts.append(s)
+    _emit(parts, p, "mFFCHprop", "abandoned-mud fraction {:.2f}")
+    _emit(parts, p, "ntg", "realized net-to-gross {:.2f}")
+    if "paint_mouth_bars" in p:
+        parts.append(
+            "mouth bars on" if p["paint_mouth_bars"] else "mouth bars off"
+        )
+    _emit(parts, p, "azimuth", "flow azimuth {:.0f}°")
+    return f"{head} with " + ", ".join(parts) + "."
 
 
 _DISPATCH = {
     "lobe": _lobe,
     "gaussian": _gaussian,
-    "meandering": _meandering,
-    "braided": _braided,
+    "channel": _channel,
     "delta": _delta,
 }

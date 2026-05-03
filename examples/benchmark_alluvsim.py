@@ -152,7 +152,7 @@ def main():
     # ----- 1. Warm up numba JIT + scipy + matplotlib (one time) -----
     print("\n[1/3] Warming up numba JIT + scipy + matplotlib (~3-10s)...")
     t0 = time.perf_counter()
-    w = gr.MeanderingChannelLayer(**GRID)
+    w = gr.ChannelLayer(**GRID)
     np.random.seed(0)
     w.create_geology(
         seed=0, ntime=15,
@@ -173,11 +173,11 @@ def main():
     # ----- 2. Per-preset generation + rendering -----
     print("\n[2/3] Generating + rendering each preset (one PNG per preset)...")
     presets = [
-        ("pv_shoestring", PV_SHOESTRING, gr.MeanderingChannelLayer),
-        ("cb_jigsaw",     CB_JIGSAW,     gr.BraidedChannelLayer),
-        ("cb_labyrinth",  CB_LABYRINTH,  gr.MeanderingChannelLayer),
-        ("sh_distal",     SH_DISTAL,     gr.MeanderingChannelLayer),
-        ("sh_proximal",   SH_PROXIMAL,   gr.BraidedChannelLayer),
+        ("pv_shoestring", PV_SHOESTRING, gr.ChannelLayer),
+        ("cb_jigsaw",     CB_JIGSAW,     gr.ChannelLayer),
+        ("cb_labyrinth",  CB_LABYRINTH,  gr.ChannelLayer),
+        ("sh_distal",     SH_DISTAL,     gr.ChannelLayer),
+        ("sh_proximal",   SH_PROXIMAL,   gr.ChannelLayer),
     ]
     print(f"      {'preset':14s}  {'gen':>6s}  {'render':>7s}  {'NTG':>6s}  {'png':<32s}")
     print(f"      {'-' * 14}  {'-' * 6}  {'-' * 7}  {'-' * 6}  {'-' * 32}")

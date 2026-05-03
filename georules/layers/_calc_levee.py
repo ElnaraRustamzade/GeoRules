@@ -26,6 +26,8 @@ def _paint_levee_kernel(
     curv, chwidth, chelev_arr, zsiz, dd, distances,
     LV_depth, LV_width, LV_height, LV_asym, LV_thin,
     facies, lk_lv, ntg_counter, max_curv, s_arr, max_s,
+    depth_norm, poro_mult_field, log_perm_offset_field,
+    ev_poro_mult, ev_log_perm_offset,
 ):
     LV_w_scale = LV_width / 6.0
     ndis = cx.size
@@ -90,6 +92,8 @@ def _paint_levee_kernel(
         # Stamp LV — unconditionally overwrites (AL ``calc_levee.for:235-241``;
         # item 1.8). NTG count only on FF/FFCH→reservoir transition.
         # AL z-face convention: ``z = zmn + iz*zsiz`` (item 2.14).
+        # Levees have no within-deposit upward fining (overbank
+        # silt/fine sand) → set depth_norm = 0.5 (neutral, ramp = 1.0).
         for iz in range(nz):
             z_face = (iz + 0.5) * zsiz
             if z_face >= levee_bottom and z_face <= levee_top:
@@ -97,6 +101,9 @@ def _paint_levee_kernel(
                 if prev < 1:
                     ntg_counter[0] += 1
                 facies[idx, idy, iz] = lk_lv
+                depth_norm[idx, idy, iz] = np.float32(0.5)
+                poro_mult_field[idx, idy, iz] = np.float32(ev_poro_mult)
+                log_perm_offset_field[idx, idy, iz] = np.float32(ev_log_perm_offset)
     return 0
 
 
@@ -112,12 +119,22 @@ def paint_levee(
     maxCHhalfwidth: float,
     *, xmn: float = 0.0, ymn: float = 0.0,
     lk_lv: int = LV,
+    depth_norm: np.ndarray | None = None,
+    poro_mult_field: np.ndarray | None = None,
+    log_perm_offset_field: np.ndarray | None = None,
+    ev_poro_mult: float = 1.0, ev_log_perm_offset: float = 0.0,
 ):
     """Public entry. No-op if LV is disabled."""
     if LV_width <= 0.0 or (LV_height + LV_depth) <= 0.0:
         return
     if cx is None or cx.size < 3:
         return
+    if depth_norm is None:
+        depth_norm = np.full((nx, ny, nz), 0.5, dtype=np.float32)
+    if poro_mult_field is None:
+        poro_mult_field = np.ones((nx, ny, nz), dtype=np.float32)
+    if log_perm_offset_field is None:
+        log_perm_offset_field = np.zeros((nx, ny, nz), dtype=np.float32)
 
     if np.isscalar(chelev_arr):
         chelev_arr = np.full(cx.size, float(chelev_arr), dtype=np.float64)
@@ -151,4 +168,6 @@ def paint_levee(
         float(LV_depth), float(LV_width), float(LV_height),
         float(LV_asym), float(LV_thin),
         facies, int(lk_lv), ntg_counter, max_curv, s_arr, max_s,
+        depth_norm, poro_mult_field, log_perm_offset_field,
+        float(ev_poro_mult), float(ev_log_perm_offset),
     )

@@ -3,8 +3,8 @@
 A single engine (``_fluvial.fluvial``) drives all reservoir architectures.
 The same parameter space that produces Alluvsim's PV-shoestring,
 CB-jigsaw, CB-labyrinth, SH-distal and SH-proximal architectures is exposed
-as kwargs on :py:meth:`MeanderingChannelLayer.create_geology` —
-``BraidedChannelLayer`` is a thin subclass that picks the CB-jigsaw
+as kwargs on :py:meth:`ChannelLayer.create_geology` —
+``ChannelLayer`` is a thin subclass that picks the CB-jigsaw
 defaults.
 
 The engine internally tracks all six Alluvsim facies
@@ -17,7 +17,7 @@ Importable parameter presets ``PV_SHOESTRING``, ``CB_JIGSAW``,
 ``CB_LABYRINTH``, ``SH_DISTAL``, ``SH_PROXIMAL`` mirror Alluvsim's
 ``runs/run_presets.py`` so users can call::
 
-    layer = MeanderingChannelLayer(nx=64, ny=64, nz=32, x_len=640,
+    layer = ChannelLayer(nx=64, ny=64, nz=32, x_len=640,
                                    y_len=640, z_len=32, top_depth=0.0)
     layer.create_geology(**PV_SHOESTRING)
 """
@@ -28,7 +28,7 @@ import numpy as np
 from .base import Layer
 
 __all__ = [
-    "ChannelLayerBase", "MeanderingChannelLayer", "BraidedChannelLayer",
+    "ChannelLayer",
     "FACIES_PROPS",
     "PV_SHOESTRING", "CB_JIGSAW", "CB_LABYRINTH", "SH_DISTAL", "SH_PROXIMAL",
     "MEANDER_OXBOW",
@@ -52,19 +52,66 @@ FACIES_PROPS: dict[int, dict[str, float]] = {
 }
 
 
-class ChannelLayerBase(Layer):
-    """Base class for channel-type geological layers."""
+class ChannelLayer(Layer):
+    """Fluvial channel-belt layer driving the Alluvsim-port engine.
+
+    One layer class for every channel architecture. Pick the
+    architecture via ``preset=`` in ``create_geology`` (PV_SHOESTRING,
+    CB_JIGSAW, CB_LABYRINTH, SH_DISTAL, SH_PROXIMAL, MEANDER_OXBOW),
+    or override individual fluvial kwargs directly.
+    """
 
     def _finalize_facies_table(self, engine_facies: np.ndarray,
-                               facies_props: dict | None = None):
-        """Convert engine 6-class facies into ``self.facies / active / poro_mat / perm_mat``.
+                               facies_props: dict | None = None,
+                               depth_norm: np.ndarray | None = None,
+                               poro_mult_field: np.ndarray | None = None,
+                               log_perm_offset_field: np.ndarray | None = None,
+                               poro_realization_mult: float = 1.0,
+                               perm_realization_mult: float = 1.0):
+        """Build ``self.facies / active / poro_mat / perm_mat`` from engine outputs.
 
-        ``self.facies`` is always the full Alluvsim 6-class array
-        (codes -1..4). ``self.active`` is the binary 0/1 sand mask
-        derived from it. Per-cell porosity and permeability come from
-        the per-facies lookup table ``FACIES_PROPS`` plus a Walker-1992
-        upward-fining ramp inside each sand column.
+        Inputs:
+
+        * ``engine_facies`` — 6-class facies cube (-1..4).
+        * ``depth_norm`` — per-cell, ∈ [0, 1]: 0 at top of channel
+          cross-section, 1 at base. Filled with 0.5 (neutral; ramp = 1.0)
+          for non-channel facies and inactive cells. Written by the
+          fluvial engine PER EVENT (no per-column leakage). When
+          ``None`` (e.g. delta merge path), uses 0.5 everywhere.
+        * ``poro_mult_field`` — per-cell, defaults to 1.0. Per-event poro
+          scalar drawn at each stamp call.
+        * ``log_perm_offset_field`` — per-cell, defaults to 0.0. Per-event
+          additive offset in log10(perm).
+        * ``poro_realization_mult`` — single scalar applied uniformly to
+          all cells in the realization (Sobol-controlled "regional rock
+          quality"). Default 1.0 (no shift).
+        * ``perm_realization_mult`` — single scalar (linear) applied
+          uniformly. log10(perm_realization_mult) is added to log_perm
+          for every cell. Sobol-sampled log-uniformly, default 1.0.
+
+        Combined formula per cell::
+
+            ramp     = 0.7 + 0.6 × depth_norm                         # [0.7, 1.3]
+            poro     = FACIES[f].poro × ramp × poro_mult_field
+                       × poro_realization_mult
+            log_perm = FACIES[f].log10_perm
+                       + KC_SLOPE × log10(ramp)                       # within-event amplified
+                       + log_perm_offset_field                        # per-event K-C offset
+                       + log10(perm_realization_mult)                 # per-realization shift
+            perm     = 10**log_perm
+
+        ``KC_SLOPE = 3.0`` matches the per-event K-C slope (= per-event
+        ``log_perm_offset_std / poro_mult_std``), so within-event poro
+        and perm vary at the same K-C ratio across the cube.
+
+        FF / FFCH cells are post-clamped to their FACIES_PROPS base
+        values (no ramp / no per-event mult / no per-realization mult);
+        they are mud, not sand, so within-deposit fining and per-event
+        K-C don't apply.
         """
+        # K-C slope for within-event ramp (matches per-event slope:
+        # log_perm_offset_std / poro_mult_std = 0.12 / 0.04 = 3.0).
+        KC_SLOPE = 3.0
         props = dict(FACIES_PROPS)
         if facies_props:
             for k, v in facies_props.items():
@@ -72,61 +119,60 @@ class ChannelLayerBase(Layer):
 
         self.facies = engine_facies.astype(np.int8)
         self.active = (self.facies >= 1).astype(np.int8)
-
-        # Per-cell base poro / perm from the per-facies lookup table.
-        poro_lut = np.zeros(self.facies.shape, dtype=np.float32)
-        for code, vals in props.items():
-            mask = (self.facies == code)
-            poro_lut[mask] = vals["poro"]
-
-        # Walker-1992 upward-fining ramp inside each sand column.
-        # See git history of this file for the derivation; in short,
-        # poro = base × (0.7 + 0.6 × depth_norm) so a CH cell at the
-        # bottom of the U-shape gets ~0.32 and one at the top ~0.20.
-        sand_mask = (self.facies >= 1)
         nx_, ny_, nz_ = self.facies.shape
-        depth_norm = np.zeros_like(poro_lut)
-        for ix in range(nx_):
-            for iy in range(ny_):
-                col = sand_mask[ix, iy, :]
-                if not col.any():
-                    continue
-                iz_top = int(np.where(col)[0].max())
-                iz_bot = int(np.where(col)[0].min())
-                ext = max(iz_top - iz_bot, 1)
-                for iz in range(iz_bot, iz_top + 1):
-                    if col[iz]:
-                        depth_norm[ix, iy, iz] = (iz_top - iz) / ext
-        ramp = 0.7 + 0.6 * depth_norm
-        poro_lut = poro_lut * ramp.astype(np.float32)
-        poro_lut[~sand_mask] = 0.0
-        for code in (-1, 0):
-            mask = (self.facies == code)
-            if mask.any() and code in props:
-                poro_lut[mask] = props[code]["poro"]
-        self.poro_mat = poro_lut
 
-        # Permeability: log10(perm) varies linearly with porosity (Kozeny-
-        # Carman-ish): ±30% poro variation → ±1.2 in log10(perm) ≈ 16×.
-        log_perm = np.zeros_like(poro_lut)
+        # Aux fields default to neutral when caller omits them
+        # (e.g. unit tests that don't go through the full engine).
+        if depth_norm is None:
+            depth_norm = np.full(self.facies.shape, 0.5, dtype=np.float32)
+        if poro_mult_field is None:
+            poro_mult_field = np.ones(self.facies.shape, dtype=np.float32)
+        if log_perm_offset_field is None:
+            log_perm_offset_field = np.zeros(self.facies.shape, dtype=np.float32)
+
+        # Base poro / log_perm by facies code from FACIES_PROPS lookup.
+        base_poro = np.zeros(self.facies.shape, dtype=np.float32)
+        base_log_perm = np.zeros(self.facies.shape, dtype=np.float32)
         for code, vals in props.items():
             mask = (self.facies == code)
-            if not mask.any():
-                continue
-            base_poro = float(vals["poro"])
-            base_log_perm = float(vals["log10_perm"])
-            ratio = (poro_lut[mask] - base_poro) / max(base_poro, 1e-6)
-            log_perm[mask] = base_log_perm + 4.0 * ratio
-        self.perm_mat = (10.0 ** log_perm).astype(np.float32)
+            if mask.any():
+                base_poro[mask] = vals["poro"]
+                base_log_perm[mask] = vals["log10_perm"]
 
+        # Per-event Walker-1992 upward-fining ramp.
+        ramp = (0.7 + 0.6 * depth_norm).astype(np.float32)
 
-class MeanderingChannelLayer(ChannelLayerBase):
-    """Meandering fluvial channel layer — full Alluvsim parameter set.
+        # Compute poro and log_perm across the full cube. Per-realization
+        # mults are constants applied uniformly. KC_SLOPE amplifies the
+        # within-event ramp on log_perm so it visibly tracks the poro
+        # gradient on a log10(perm) colormap.
+        poro_realization_mult_f32 = np.float32(poro_realization_mult)
+        log_perm_realization_offset_f32 = np.float32(
+            np.log10(max(float(perm_realization_mult), 1e-9))
+        )
+        poro_mat = (base_poro * ramp * poro_mult_field
+                    * poro_realization_mult_f32)
+        log_perm = (base_log_perm
+                    + KC_SLOPE * np.log10(np.maximum(ramp, 1e-6))
+                    + log_perm_offset_field
+                    + log_perm_realization_offset_f32)
 
-    The defaults below produce a PV-shoestring-style reservoir on a
-    typical 64-128 cell grid; pass ``**CB_JIGSAW`` or another preset for
-    a different architecture, or override individual params.
-    """
+        # Mud cells (FF, FFCH) get base FACIES_PROPS values — no ramp,
+        # no per-event mult, no per-realization shift (mud is not the
+        # reservoir-quality control variable in this scheme).
+        mud_mask = (self.facies == -1) | (self.facies == 0)
+        if mud_mask.any():
+            poro_mat[mud_mask] = base_poro[mud_mask]
+            log_perm[mud_mask] = base_log_perm[mud_mask]
+
+        # Inactive cells (FF=-1) get poro = base FF value; perm tracks.
+        # Clip poro to a physical range to avoid float16 overflow / negatives.
+        poro_mat = np.clip(poro_mat, 0.0, 0.5)
+        perm_mat = (10.0 ** log_perm).astype(np.float32)
+
+        self.poro_mat = poro_mat.astype(np.float32)
+        self.perm_mat = perm_mat.astype(np.float32)
+
 
     def create_geology(
         self,
@@ -182,6 +228,13 @@ class MeanderingChannelLayer(ChannelLayerBase):
         # ---- presentation ----------------------------------------------
         azimuth: float = 0.0,
         facies_props: dict | None = None,
+        # ---- per-realization rock-quality (sampler-controlled) ---------
+        # Multiplies poro and perm uniformly across the cube — the
+        # "regional reservoir quality" knob, analogous to lobes' direct
+        # ``poro_ave`` / ``perm_ave`` Sobol sampling. Per-event mults
+        # (drawn at each stamp call inside the engine) wiggle on top.
+        poro_realization_mult: float = 1.0,
+        perm_realization_mult: float = 1.0,
         seed: int | None = None,
     ):
         """Generate channel geology with Alluvsim-faithful semantics.
@@ -240,28 +293,27 @@ class MeanderingChannelLayer(ChannelLayerBase):
             azimuth=azimuth, seed=seed,
         )
         engine.simulation()
-        self._finalize_facies_table(engine.facies, facies_props=facies_props)
-
-
-class BraidedChannelLayer(MeanderingChannelLayer):
-    """Braided fluvial channels — ``MeanderingChannelLayer`` with CB-jigsaw defaults.
-
-    Same engine, just defaults that produce the dense interwoven
-    multi-thread architecture: shallow wide channels, aggressive in-model
-    avulsion, prominent FFCH abandonment.
-    """
-
-    def create_geology(self, **kwargs):
-        defaults = dict(CB_JIGSAW)
-        defaults.update(kwargs)
-        super().create_geology(**defaults)
+        self._finalize_facies_table(
+            engine.facies, facies_props=facies_props,
+            depth_norm=engine.depth_norm,
+            poro_mult_field=engine.poro_mult_field,
+            log_perm_offset_field=engine.log_perm_offset_field,
+            poro_realization_mult=poro_realization_mult,
+            perm_realization_mult=perm_realization_mult,
+        )
+        # Stash for downstream tooling (parquet writers can record the
+        # engine-level multiplier std values, generate.py uses these to
+        # derive realized poro_ave / perm_ave for the slim parquet).
+        self._engine = engine
+        self.poro_mult_std = float(engine.poro_mult_std)
+        self.log_perm_offset_std = float(engine.log_perm_offset_std)
 
 
 # ---------------------------------------------------------------------------
 # Importable parameter presets (mirror /home/ilgar/Alluvsim/runs/run_presets.py).
 #
-# Use as `MeanderingChannelLayer.create_geology(**PV_SHOESTRING)` or pass
-# individual overrides on top.
+# Use as `ChannelLayer.create_geology(**PV_SHOESTRING)` or pass individual
+# overrides on top.
 # ---------------------------------------------------------------------------
 # NOTE on preset ``nlevel`` / ``level_z`` / ``mCHdepth`` choice
 # -------------------------------------------------------------

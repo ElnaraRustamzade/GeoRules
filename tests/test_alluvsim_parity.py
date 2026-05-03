@@ -2,8 +2,8 @@
 
 Drives the Alluvsim Fortran binary at ``/home/ilgar/Alluvsim/build/alluvsim``
 via Alluvsim's own Python helper (``alluvsim_io.run_alluvsim``) and compares
-its facies output to GeoRules' ``MeanderingChannelLayer`` /
-``BraidedChannelLayer`` output for the same parameters.
+its facies output to GeoRules' ``ChannelLayer`` /
+``ChannelLayer`` output for the same parameters.
 
 Two layers of validation:
 
@@ -109,7 +109,7 @@ def run_georules_preset(name: str, params: dict) -> np.ndarray:
     in this helper so the rewrite can keep evolving the layer constructor
     signature without breaking the test harness.
     """
-    from georules.layers.channel import MeanderingChannelLayer, BraidedChannelLayer
+    from georules.layers.channel import ChannelLayer, ChannelLayer
 
     nx, ny, nz = params["nx"], params["ny"], params["nz"]
     xsiz, ysiz, zsiz = params["xsiz"], params["ysiz"], params["zsiz"]
@@ -119,7 +119,7 @@ def run_georules_preset(name: str, params: dict) -> np.ndarray:
     # the rest use Meandering. Keep it simple — both classes accept the same
     # underlying parameter set after the rewrite.
     is_braided = name in ("cb_jigsaw", "sh_proximal")
-    LayerCls = BraidedChannelLayer if is_braided else MeanderingChannelLayer
+    LayerCls = ChannelLayer if is_braided else ChannelLayer
 
     layer = LayerCls(
         nx=nx, ny=ny, nz=nz,
@@ -133,7 +133,7 @@ def run_georules_preset(name: str, params: dict) -> np.ndarray:
     np.random.seed(int(params["seed"]))
 
     # NOTE: The kwarg set passed below is a SUPERSET of what the current
-    # MeanderingChannelLayer.create_geology accepts. Step 1 of the rewrite
+    # ChannelLayer.create_geology accepts. Step 1 of the rewrite
     # (CH-only baseline) will add the missing kwargs to the constructor.
     # Until then, this helper passes only the kwargs that exist.
     common_kwargs = _build_georules_kwargs(params)
@@ -144,7 +144,7 @@ def run_georules_preset(name: str, params: dict) -> np.ndarray:
 
 def _build_georules_kwargs(params: dict) -> dict:
     """Translate Alluvsim ``streamsim.par`` dict → GeoRules
-    ``MeanderingChannelLayer.create_geology`` kwargs.
+    ``ChannelLayer.create_geology`` kwargs.
 
     After the rewrite, GeoRules accepts the full Alluvsim parameter
     namespace verbatim, so the mapping is mostly a copy. The few

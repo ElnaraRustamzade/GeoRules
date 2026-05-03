@@ -5,6 +5,14 @@ Each rank owns its own shard namespace,
 between ranks is needed. Shards are assembled in a ``.tmp`` sibling
 directory and atomically renamed into place, so a shard is either
 complete or absent.
+
+Two parquet files are written per shard:
+
+* ``params.parquet`` — full schema, every meta key, for reproducibility.
+* ``params_slim.parquet`` — only the columns flow-matching training uses
+  (whitelist defined in :mod:`georules.dataset.schemas`). Both are
+  per-row aligned with the ``facies.npy`` / ``poro.npy`` / ``perm.npy`` /
+  ``facies_alluvsim.npy`` arrays.
 """
 
 import os
@@ -14,6 +22,8 @@ from pathlib import Path
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+from .schemas import slim_columns
 
 
 class ShardWriter:
@@ -27,13 +37,15 @@ class ShardWriter:
         self._facies: list = []
         self._poro: list = []
         self._perm: list = []
+        self._facies_alluvsim: list = []
         self._meta: list = []
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    def add(self, facies, poro, perm, meta):
+    def add(self, facies, poro, perm, facies_alluvsim, meta):
         self._facies.append(facies)
         self._poro.append(poro)
         self._perm.append(perm)
+        self._facies_alluvsim.append(facies_alluvsim)
         self._meta.append(meta)
         if len(self._facies) >= self.shard_size:
             self._flush()
@@ -53,12 +65,34 @@ class ShardWriter:
         np.save(tmp_dir / "facies.npy", np.stack(self._facies).astype(np.int8))
         np.save(tmp_dir / "poro.npy", np.stack(self._poro).astype(np.float16))
         np.save(tmp_dir / "perm.npy", np.stack(self._perm).astype(np.float16))
+        np.save(tmp_dir / "facies_alluvsim.npy",
+                np.stack(self._facies_alluvsim).astype(np.int8))
 
-        # Union of keys across the shard (different layer types have disjoint
-        # physics params); missing values become null in parquet.
+        # Full parquet: union of keys across all rows in the shard
+        # (different layer types have disjoint physics params; missing
+        # values become null per pyarrow's union semantics).
         all_keys = sorted({k for m in self._meta for k in m.keys()})
         columns = {k: [m.get(k) for m in self._meta] for k in all_keys}
         pq.write_table(pa.Table.from_pydict(columns), tmp_dir / "params.parquet")
+
+        # Slim parquet: per-row whitelist derived from each row's
+        # ``layer_type``. Union the whitelists across all rows in the
+        # shard to get the slim schema; rows that don't carry a column
+        # get null. This keeps the slim file column-compatible across
+        # mixed-layer-type shards (e.g. a future combined dataset).
+        slim_keys: set[str] = set()
+        for m in self._meta:
+            slim_keys.update(slim_columns(m.get("layer_type", "")))
+        slim_keys_sorted = sorted(slim_keys)
+        slim_columns_data = {
+            k: [
+                (m.get(k) if k in slim_columns(m.get("layer_type", "")) else None)
+                for m in self._meta
+            ]
+            for k in slim_keys_sorted
+        }
+        pq.write_table(pa.Table.from_pydict(slim_columns_data),
+                       tmp_dir / "params_slim.parquet")
 
         if shard_dir.exists():
             raise FileExistsError(
@@ -71,4 +105,5 @@ class ShardWriter:
         self._facies.clear()
         self._poro.clear()
         self._perm.clear()
+        self._facies_alluvsim.clear()
         self._meta.clear()
